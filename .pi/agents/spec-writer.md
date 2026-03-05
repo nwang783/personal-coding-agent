@@ -24,10 +24,11 @@ Recommended invocation pattern:
 Requirements:
 - Analyze the user task carefully.
 - Inspect repository files when helpful.
-- Prefer clear sections: Goal, Constraints, Acceptance Criteria, Complexity Signals, Implementation Notes.
+- Prefer clear sections: Goal, Constraints, Acceptance Criteria, Complexity Signals, Implementation Phases, Phase Completion Checks, Implementation Notes.
 - No strict JSON requirement.
 
 Quality bar:
 - Acceptance criteria must be testable.
 - Constraints must include safety and compatibility limits.
 - Complexity signals should identify architecture breadth and risk.
+- Include explicit phased implementation guidance and verifiable checks for each phase.

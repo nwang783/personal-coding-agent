@@ -1,7 +1,7 @@
 # personal-coding-agent
 
 Pi.dev autonomous orchestrator setup for spec -> implement -> review/fix -> validation -> final report.
-Implementation agents are also configured to create GitHub PRs with `gh` when feasible.
+Reviewer agent is configured to own git integration: commit/push, CI status checks, and PR updates.
 Spec generation, implementation, and review are dispatcher-based: Pi subagents call external `codex`/`amp` CLIs instead of directly doing those steps.
 
 ## Included
@@ -42,6 +42,8 @@ Spec generation, implementation, and review are dispatcher-based: Pi subagents c
   - `.pi/reports/<task-id>.md`
   - `.pi/reports/<task-id>.live.log` (stage-by-stage live progress)
   - `.pi/reports/<task-id>.trace/` (exact subagent prompts/results)
+- Per-task isolated worktrees:
+  - `.pi/worktrees/<task-id>/`
 
 ## GitHub PR requirements
 
@@ -71,6 +73,28 @@ For deterministic control flow, delegated agents should include a tiny `DECISION
 - `loop_back_to: implementation | review | validation | none`
 - `pr_url: <url or empty>`
 Then they can use normal English in `DETAILS`.
+
+Review policy:
+- P0/P1 findings are always blocking.
+- P2/P3-only findings can be triaged by the implementation dispatcher, which may defer them and continue to validation.
+- Max review iterations per task: 3.
+- Reviewer attempts to reuse the same Codex review session (`codex_session_id`) for continuity.
+
+Runtime prompt guardrails injected into every subagent system prompt:
+- repository root path and active worktree path
+- explicit instruction to work only in the active worktree path
+- active branch name
+- explicit instruction not to clone the repo again
+
+Repository path derivation:
+- `repoPath` is derived from an explicit repository path in the task text when present (for example `~/Projects/claw-social`), otherwise it falls back to the Pi session cwd.
+- That path is written into task state and into the generated spec metadata.
+- All later stages read from task state, not transient cwd.
+
+Context continuity between agents:
+- Spec text is passed directly into implementation/review/validation prompts.
+- Review and validation also receive previous stage summaries.
+- Reviewer can reuse a persistent `codex_session_id` for continuity across review loops.
 
 ## Runtime controls
 

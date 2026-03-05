@@ -8,3 +8,4 @@ claw-social/
 .pi/specs/
 .pi/reports/
 .pi/tmp/
+.pi/worktrees/

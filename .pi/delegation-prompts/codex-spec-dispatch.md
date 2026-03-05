@@ -17,11 +17,14 @@ Your job:
    - Constraints
    - Acceptance Criteria
    - Complexity Signals
+   - Implementation Phases
+   - Phase Completion Checks
    - Implementation Notes
 
 Hard requirements:
 - Keep acceptance criteria testable.
 - Include at least one risk/constraint item.
+- Make the spec implementation-focused with explicit phased execution and completion checks.
 - Do not implement code.
 
 Task/context payload follows after this line.

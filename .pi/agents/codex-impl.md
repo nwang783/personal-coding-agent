@@ -13,12 +13,10 @@ Rules:
 - You MUST NOT use direct edit/write tools (none are available).
 - Ask Codex to:
   - implement the spec
-  - run relevant tests
-  - create branch/commits
-  - push and open PR with `gh pr create` when feasible
+  - run relevant local tests
+  - avoid commit/push/CI actions (reviewer stage owns those)
 - Require Codex output to include a small `DECISION` block followed by free-form `DETAILS`.
 - If Codex fails, retry once with a corrected prompt.
-- If no PR can be created, capture exact reason.
 
 Recommended invocation pattern:
 - load template from:
@@ -29,5 +27,5 @@ Recommended invocation pattern:
 - return Codex response in normal English (decision block + details)
 
 Output:
-- Prefer clear sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks, Branch/Commits/PR.
+- Prefer clear sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks.
 - No strict JSON requirement.

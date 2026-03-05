@@ -27,6 +27,9 @@ type TaskState = {
 	id: string;
 	title: string;
 	originalTask: string;
+	repoPath: string;
+	worktreePath?: string;
+	worktreeBranch?: string;
 	status: TaskStatus;
 	stage: TaskStage;
 	createdAt: string;
@@ -48,6 +51,7 @@ type TaskState = {
 	lastPrFailureReason?: string;
 	lastReviewSummary?: string;
 	lastValidationSummary?: string;
+	codexReviewSessionId?: string;
 	blockingFindings: ReviewFinding[];
 	validationIssues: string[];
 	history: Array<{ at: string; stage: TaskStage; note: string }>;
@@ -77,6 +81,43 @@ type SubagentRun = {
 
 function nowIso(): string {
 	return new Date().toISOString();
+}
+
+function expandHome(input: string): string {
+	if (!input.startsWith("~")) return input;
+	const home = process.env.HOME;
+	if (!home) return input;
+	if (input === "~") return home;
+	if (input.startsWith("~/")) return path.join(home, input.slice(2));
+	return input;
+}
+
+function isGitRepoRoot(candidate: string): boolean {
+	try {
+		const stat = fs.statSync(candidate);
+		if (!stat.isDirectory()) return false;
+		return fs.existsSync(path.join(candidate, ".git"));
+	} catch {
+		return false;
+	}
+}
+
+function deriveRepoPathFromTask(taskInput: string, fallbackCwd: string): string {
+	const candidates = new Set<string>();
+	const raw = taskInput.trim();
+
+	for (const match of raw.matchAll(/\((~?\/[^)]+)\)/g)) {
+		candidates.add(match[1]);
+	}
+	for (const match of raw.matchAll(/\b(~\/[^\s"')]+|\/[^\s"')]+)\b/g)) {
+		candidates.add(match[1]);
+	}
+
+	for (const candidate of candidates) {
+		const resolved = path.resolve(expandHome(candidate));
+		if (isGitRepoRoot(resolved)) return resolved;
+	}
+	return fallbackCwd;
 }
 
 function getSubagentTimeoutMs(): number {
@@ -240,6 +281,8 @@ function normalizeSpecOutput(
 	acceptanceCriteria: string[];
 	complexitySignals: string[];
 	implementationNotes: string[];
+	implementationPhases: string[];
+	phaseCompletionChecks: string[];
 } {
 	if (specJson) {
 		return {
@@ -254,6 +297,12 @@ function normalizeSpecOutput(
 			implementationNotes: Array.isArray(specJson.implementationNotes)
 				? specJson.implementationNotes.map((x) => String(x))
 				: [],
+			implementationPhases: Array.isArray(specJson.implementationPhases)
+				? specJson.implementationPhases.map((x) => String(x))
+				: [],
+			phaseCompletionChecks: Array.isArray(specJson.phaseCompletionChecks)
+				? specJson.phaseCompletionChecks.map((x) => String(x))
+				: [],
 		};
 	}
 
@@ -265,7 +314,23 @@ function normalizeSpecOutput(
 	const acceptanceCriteria = extractBullets(extractSection(rawText, "Acceptance Criteria"));
 	const complexitySignals = extractBullets(extractSection(rawText, "Complexity Signals"));
 	const implementationNotes = extractBullets(extractSection(rawText, "Implementation Notes"));
-	return { goal, constraints, acceptanceCriteria, complexitySignals, implementationNotes };
+	const implementationPhasesPrimary = extractBullets(extractSection(rawText, "Implementation Phases"));
+	const implementationPhasesFallback = extractBullets(extractSection(rawText, "Phases"));
+	const implementationPhases =
+		implementationPhasesPrimary.length > 0 ? implementationPhasesPrimary : implementationPhasesFallback;
+	const phaseCompletionChecksPrimary = extractBullets(extractSection(rawText, "Phase Completion Checks"));
+	const phaseCompletionChecksFallback = extractBullets(extractSection(rawText, "Completion Checks"));
+	const phaseCompletionChecks =
+		phaseCompletionChecksPrimary.length > 0 ? phaseCompletionChecksPrimary : phaseCompletionChecksFallback;
+	return {
+		goal,
+		constraints,
+		acceptanceCriteria,
+		complexitySignals,
+		implementationNotes,
+		implementationPhases,
+		phaseCompletionChecks,
+	};
 }
 
 function normalizeImplementationOutput(
@@ -281,6 +346,9 @@ function normalizeImplementationOutput(
 	commitShas?: string[];
 	prUrl?: string;
 	prFailureReason?: string;
+	decisionStatus?: string;
+	decisionBlocking?: string;
+	decisionLoopBackTo?: string;
 } {
 	if (implJson) {
 		return {
@@ -293,6 +361,9 @@ function normalizeImplementationOutput(
 			commitShas: Array.isArray(implJson.commitShas) ? implJson.commitShas.map((x) => String(x)) : undefined,
 			prUrl: implJson.prUrl ? String(implJson.prUrl) : undefined,
 			prFailureReason: implJson.prFailureReason ? String(implJson.prFailureReason) : undefined,
+			decisionStatus: implJson.decisionStatus ? String(implJson.decisionStatus) : undefined,
+			decisionBlocking: implJson.decisionBlocking ? String(implJson.decisionBlocking) : undefined,
+			decisionLoopBackTo: implJson.decisionLoopBackTo ? String(implJson.decisionLoopBackTo) : undefined,
 		};
 	}
 
@@ -310,6 +381,9 @@ function normalizeImplementationOutput(
 		commitShas: commitShas.length > 0 ? commitShas : undefined,
 		prUrl: decision.pr_url || prUrl,
 		prFailureReason: decision.pr_failure_reason || extractSection(rawText, "PR Failure Reason") || undefined,
+		decisionStatus: decision.status,
+		decisionBlocking: decision.blocking,
+		decisionLoopBackTo: decision.loop_back_to,
 	};
 }
 
@@ -320,6 +394,11 @@ function normalizeReviewOutput(
 	approved: boolean;
 	blockingFindings: ReviewFinding[];
 	fixInstructions: string;
+	codexSessionId?: string;
+	branchName?: string;
+	commitShas?: string[];
+	prUrl?: string;
+	prFailureReason?: string;
 } {
 	if (reviewJson) {
 		const blocking = Array.isArray(reviewJson.blockingFindings) ? reviewJson.blockingFindings : [];
@@ -336,6 +415,11 @@ function normalizeReviewOutput(
 				};
 			}),
 			fixInstructions: String(reviewJson.fixInstructions ?? ""),
+			codexSessionId: reviewJson.codexSessionId ? String(reviewJson.codexSessionId) : undefined,
+			branchName: reviewJson.branchName ? String(reviewJson.branchName) : undefined,
+			commitShas: Array.isArray(reviewJson.commitShas) ? reviewJson.commitShas.map((x) => String(x)) : undefined,
+			prUrl: reviewJson.prUrl ? String(reviewJson.prUrl) : undefined,
+			prFailureReason: reviewJson.prFailureReason ? String(reviewJson.prFailureReason) : undefined,
 		};
 	}
 
@@ -358,6 +442,9 @@ function normalizeReviewOutput(
 		[/\bnot approved\b/i, /\bfail(?:ed|s)?\b/i, /\bblocking\b/i],
 		findings.length === 0,
 	);
+	const branchName = rawText.match(/branch(?:\s*name)?\s*[:=-]\s*([A-Za-z0-9._/-]+)/i)?.[1];
+	const commitShas = Array.from(new Set(rawText.match(/\b[0-9a-f]{7,40}\b/gi) ?? []));
+	const prUrl = rawText.match(/https?:\/\/github\.com\/[^\s)]+\/pull\/\d+/i)?.[0];
 	const blockingFromDecision = parseYesNo(
 		decision.blocking ?? "",
 		[/\byes\b/i, /\btrue\b/i],
@@ -368,6 +455,11 @@ function normalizeReviewOutput(
 		approved: approved && !blockingFromDecision,
 		blockingFindings: findings,
 		fixInstructions: extractSection(rawText, "Fix Instructions") || rawText.trim(),
+		codexSessionId: decision.codex_session_id || decision.review_session_id,
+		branchName: decision.branch || decision.branch_name || branchName,
+		commitShas: commitShas.length > 0 ? commitShas : undefined,
+		prUrl: decision.pr_url || prUrl,
+		prFailureReason: decision.pr_failure_reason || extractSection(rawText, "PR Failure Reason") || undefined,
 	};
 }
 
@@ -407,14 +499,31 @@ function renderSpecMarkdown(
 		acceptanceCriteria: string[];
 		complexitySignals: string[];
 		implementationNotes: string[];
+		implementationPhases: string[];
+		phaseCompletionChecks: string[];
 	},
 ): string {
+	const phases =
+		specData.implementationPhases.length > 0
+			? specData.implementationPhases
+			: ["Phase 1: Foundation", "Phase 2: Implementation", "Phase 3: Verification and Handoff"];
+	const checks =
+		specData.phaseCompletionChecks.length > 0
+			? specData.phaseCompletionChecks
+			: [
+					"Phase 1 artifacts created and wired (types/modules/hooks/interfaces).",
+					"Phase 2 feature behavior implemented and integrated in target surfaces.",
+					"Phase 3 tests pass and manual verification evidence is captured.",
+				];
 	return [
 		`# Spec: ${task.title}`,
 		"",
 		`- Task ID: ${task.id}`,
 		`- Created: ${task.createdAt}`,
 		`- Updated: ${task.updatedAt}`,
+		`- Repository Root: ${task.repoPath}`,
+		`- Worktree Path: ${task.worktreePath ?? "n/a"}`,
+		`- Worktree Branch: ${task.worktreeBranch ?? "n/a"}`,
 		"",
 		"## Goal",
 		specData.goal,
@@ -427,6 +536,12 @@ function renderSpecMarkdown(
 		"",
 		"## Complexity Signals",
 		...specData.complexitySignals.map((x) => `- ${x}`),
+		"",
+		"## Implementation Phases",
+		...phases.map((x, i) => `${i + 1}. ${x}`),
+		"",
+		"## Phase Completion Checks",
+		...checks.map((x) => `- [ ] ${x}`),
 		"",
 		"## Implementation Notes",
 		...specData.implementationNotes.map((x) => `- ${x}`),
@@ -465,9 +580,13 @@ function summarizeState(state: TaskState): string {
 		`Task ${state.id}: ${state.title}`,
 		`Status: ${state.status}`,
 		`Stage: ${state.stage}`,
+		`Repo: ${state.repoPath}`,
+		state.worktreePath ? `Worktree: ${state.worktreePath}` : undefined,
+		state.worktreeBranch ? `Worktree branch: ${state.worktreeBranch}` : undefined,
 		`Review loops: ${state.reviewLoops}/${state.maxReviewLoops}`,
 		`Validation loops: ${state.validationLoops}/${state.maxValidationLoops}`,
 		state.routedAgent ? `Implementation agent: ${state.routedAgent}` : undefined,
+		state.codexReviewSessionId ? `Codex review session: ${state.codexReviewSessionId}` : undefined,
 		state.lastBranchName ? `Branch: ${state.lastBranchName}` : undefined,
 		state.lastPrUrl ? `PR: ${state.lastPrUrl}` : undefined,
 		state.lastPrFailureReason ? `PR status: ${state.lastPrFailureReason}` : undefined,
@@ -481,6 +600,10 @@ async function runSubagent(
 	ctx: ExtensionContext,
 	agent: AgentConfig,
 	taskPrompt: string,
+	runCwd: string,
+	repoRootPath: string,
+	worktreePath: string,
+	worktreeBranch: string | undefined,
 ): Promise<SubagentRun> {
 	const args = ["--mode", "json", "-p", "--no-session"];
 	if (agent.model) args.push("--model", agent.model);
@@ -492,12 +615,22 @@ async function runSubagent(
 			const tempDir = path.join(ctx.cwd, ".pi", "tmp");
 			ensureDir(tempDir);
 			promptFile = path.join(tempDir, `orchestrator-prompt-${safeFilename(agent.name)}-${Date.now()}.md`);
-			fs.writeFileSync(promptFile, agent.systemPrompt, "utf-8");
+			const runtimeGuardrails = [
+				"",
+				"Runtime guardrails:",
+				`- Repository root path: ${repoRootPath}`,
+				`- Active worktree path: ${worktreePath}`,
+				`- Active git branch: ${worktreeBranch ?? "(unknown)"}`,
+				"- Always work in the active worktree path above.",
+				"- Do not clone the repository again.",
+				"- Do not create nested duplicate repos.",
+			].join("\n");
+			fs.writeFileSync(promptFile, `${agent.systemPrompt}\n${runtimeGuardrails}\n`, "utf-8");
 			args.push("--append-system-prompt", promptFile);
 		}
 		args.push(`Task: ${taskPrompt}`);
 
-		const result = await pi.exec("pi", args, { timeout: getSubagentTimeoutMs() });
+		const result = await pi.exec("pi", args, { timeout: getSubagentTimeoutMs(), cwd: runCwd });
 		const assistantChunks: string[] = [];
 		let finalAssistantText = "";
 
@@ -535,6 +668,45 @@ async function runSubagent(
 		if (promptFile && fs.existsSync(promptFile)) {
 			fs.unlinkSync(promptFile);
 		}
+	}
+}
+
+async function ensureTaskWorktree(pi: ExtensionAPI, state: TaskState): Promise<void> {
+	const worktreesRoot = path.join(state.repoPath, ".pi", "worktrees");
+	ensureDir(worktreesRoot);
+
+	if (!state.worktreePath) {
+		state.worktreePath = path.join(worktreesRoot, safeFilename(state.id));
+	}
+	if (!state.worktreeBranch) {
+		state.worktreeBranch = `pi/${safeFilename(state.id).slice(0, 52)}`;
+	}
+
+	const existingGit = path.join(state.worktreePath, ".git");
+	if (!fs.existsSync(existingGit)) {
+		ensureDir(path.dirname(state.worktreePath));
+		// Create isolated branch/worktree for this task.
+		const addResult = await pi.exec(
+			"git",
+			["-C", state.repoPath, "worktree", "add", "-b", state.worktreeBranch, state.worktreePath, "HEAD"],
+			{ timeout: 120_000 },
+		);
+		if (addResult.code !== 0) {
+			// Fallback for resumed tasks/branches that may already exist.
+			const retry = await pi.exec(
+				"git",
+				["-C", state.repoPath, "worktree", "add", state.worktreePath, state.worktreeBranch],
+				{ timeout: 120_000 },
+			);
+			if (retry.code !== 0) {
+				throw new Error(`Failed to create worktree: ${addResult.stderr || retry.stderr || "unknown git error"}`);
+			}
+		}
+	}
+
+	const branchResult = await pi.exec("git", ["-C", state.worktreePath, "branch", "--show-current"], { timeout: 10_000 });
+	if (branchResult.code === 0 && branchResult.stdout.trim()) {
+		state.worktreeBranch = branchResult.stdout.trim();
 	}
 }
 
@@ -614,6 +786,8 @@ function refreshLiveUi(ctx: ExtensionContext, state: TaskState): void {
 		`${th.fg("muted", "Task")} ${th.fg("accent", state.id)}`,
 		`${th.fg("muted", "Status")} ${th.fg(statusColor, state.status)}  ${th.fg("muted", "Stage")} ${th.fg("warning", state.stage)}`,
 		`${th.fg("muted", "Loops")} R ${state.reviewLoops}/${state.maxReviewLoops} | V ${state.validationLoops}/${state.maxValidationLoops}`,
+		`${th.fg("muted", "Repo")} ${th.fg("accent", shortenMiddle(state.worktreePath ?? state.repoPath, 96))}`,
+		`${th.fg("muted", "Branch")} ${th.fg("accent", state.worktreeBranch ?? "(unknown)")}`,
 		`${th.fg("muted", "Agent")} ${state.activeAgentName ? th.fg("success", state.activeAgentName) : th.fg("dim", "idle")} ${th.fg("dim", state.activeAgentPurpose ? `(${state.activeAgentPurpose})` : "")}`,
 		`${th.fg("muted", "View")} ${th.fg("accent", widgetMode)} ${th.fg("dim", "(switch: /orchestrate-widget <compact|spec|prompt|result|history>)")}`,
 	];
@@ -660,7 +834,7 @@ function recordProgress(
 ): void {
 	appendHistory(state, stage, note);
 	persistTask(pi, state);
-	const liveLogPath = getLiveLogPath(ctx.cwd, state);
+	const liveLogPath = getLiveLogPath(state.repoPath, state);
 	fs.appendFileSync(liveLogPath, `${state.updatedAt} [${stage}] ${note}\n`, "utf-8");
 	refreshLiveUi(ctx, state);
 }
@@ -675,7 +849,12 @@ function loadPersistedTasks(ctx: ExtensionContext): Map<string, TaskState> {
 	for (const entry of entries) {
 		const e = entry as { type?: string; customType?: string; data?: TaskState };
 		if (e.type !== "custom" || e.customType !== "pi-orchestrator-task" || !e.data?.id) continue;
-		tasks.set(e.data.id, e.data);
+		tasks.set(e.data.id, {
+			...e.data,
+			repoPath: e.data.repoPath ?? ctx.cwd,
+			maxReviewLoops: e.data.maxReviewLoops ?? 3,
+			maxValidationLoops: e.data.maxValidationLoops ?? 3,
+		});
 	}
 	return tasks;
 }
@@ -702,7 +881,11 @@ function buildReportMarkdown(state: TaskState, reporterOutput: string): string {
 		`- Task ID: ${state.id}`,
 		`- Final Status: ${state.status.toUpperCase()}`,
 		`- Final Stage: ${state.stage}`,
+		`- Repository Root: ${state.repoPath}`,
+		`- Worktree Path: ${state.worktreePath ?? "n/a"}`,
+		`- Worktree Branch: ${state.worktreeBranch ?? "n/a"}`,
 		`- Routed Implementation Agent: ${state.routedAgent ?? "n/a"}`,
+		`- Codex Review Session: ${state.codexReviewSessionId ?? "n/a"}`,
 		`- Branch: ${state.lastBranchName ?? "n/a"}`,
 		`- Pull Request: ${state.lastPrUrl ?? "n/a"}`,
 		`- PR Failure Reason: ${state.lastPrFailureReason ?? "n/a"}`,
@@ -763,15 +946,24 @@ async function runWorkflow(
 	};
 
 	const runAgent = async (agentName: string, purpose: string, prompt: string): Promise<SubagentRun> => {
+		const executionPath = state.worktreePath ?? state.repoPath;
+		const contextualPrompt = [
+			`Execution repository path: ${executionPath}`,
+			`Repository root path: ${state.repoPath}`,
+			`Execution git branch: ${state.worktreeBranch ?? "(unknown)"}`,
+			"Do not clone this repository again. Work only in the execution repository path above.",
+			"",
+			prompt,
+		].join("\n");
 		const seq = (state.traceSeq ?? 0) + 1;
 		state.traceSeq = seq;
-		const traceDir = getTraceDir(ctx.cwd, state);
+		const traceDir = getTraceDir(state.repoPath, state);
 		const stem = `${String(seq).padStart(3, "0")}-${safeFilename(agentName)}-${safeFilename(purpose).slice(0, 48)}`;
 		const promptPath = path.join(traceDir, `${stem}.prompt.md`);
 		const resultPath = path.join(traceDir, `${stem}.result.md`);
 		const metaPath = path.join(traceDir, `${stem}.meta.json`);
 
-		fs.writeFileSync(promptPath, prompt, "utf-8");
+		fs.writeFileSync(promptPath, contextualPrompt, "utf-8");
 		state.activeAgentName = agentName;
 		state.activeAgentPurpose = purpose;
 		state.lastPromptPath = promptPath;
@@ -785,7 +977,16 @@ async function runWorkflow(
 			const secs = Math.floor((Date.now() - started) / 1000);
 			recordProgress(pi, ctx, state, state.stage, `Waiting on ${agentName} (${purpose}) for ${secs}s`);
 		}, 60_000);
-		const run = await runSubagent(pi, ctx, getAgent(agentName), prompt).finally(() => {
+		const run = await runSubagent(
+			pi,
+			ctx,
+			getAgent(agentName),
+			contextualPrompt,
+			executionPath,
+			state.repoPath,
+			executionPath,
+			state.worktreeBranch,
+		).finally(() => {
 			clearInterval(heartbeat);
 		});
 
@@ -835,6 +1036,14 @@ async function runWorkflow(
 	state.status = "running";
 	persistTask(pi, state);
 	refreshLiveUi(ctx, state);
+	await ensureTaskWorktree(pi, state);
+	recordProgress(
+		pi,
+		ctx,
+		state,
+		"received",
+		`Worktree ready at ${state.worktreePath} on branch ${state.worktreeBranch}`,
+	);
 
 	// 1) Spec stage
 	if (state.specPath && !fs.existsSync(state.specPath)) {
@@ -845,9 +1054,11 @@ async function runWorkflow(
 		const specPrompt = [
 			"Create the central implementation spec for this task.",
 			"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-			"Preferred format: Goal, Constraints, Acceptance Criteria, Complexity Signals, Implementation Notes.",
+			"Preferred format: Goal, Constraints, Acceptance Criteria, Complexity Signals, Implementation Phases, Phase Completion Checks, Implementation Notes.",
+			"The spec should be implementation-oriented and phase-driven, with clear completion checks.",
 			"JSON is optional.",
 			"",
+			`Target repository root path:\n${state.repoPath}`,
 			`User task:\n${state.originalTask}`,
 		].join("\n");
 		const specRun = await runAgent("spec-writer", "spec-generation", specPrompt);
@@ -855,7 +1066,7 @@ async function runWorkflow(
 		const specJson = extractJsonObject(specRun.finalAssistantText) ?? extractJsonObject(specRun.fullAssistantText);
 		const specData = normalizeSpecOutput(specRun.finalAssistantText || specRun.fullAssistantText, specJson, state.originalTask);
 
-		const specDir = path.join(ctx.cwd, ".pi", "specs");
+		const specDir = path.join(state.repoPath, ".pi", "specs");
 		ensureDir(specDir);
 		const specPath = path.join(specDir, `${safeFilename(state.id)}.md`);
 		fs.writeFileSync(specPath, renderSpecMarkdown(state, specData), "utf-8");
@@ -881,9 +1092,10 @@ async function runWorkflow(
 		recordProgress(pi, ctx, state, "implementation", `Implementation attempt ${state.reviewLoops}`);
 
 		const implPrompt = [
-			"Implement this spec in the repository. Apply real file changes and run relevant tests.",
+			"Implement this spec in the repository. Apply real file changes and run relevant local tests.",
+			"Do not commit, push, or check CI in this step. The reviewer stage owns commit/push/CI.",
 			"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-			"Preferred response sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks, PR info.",
+			"Preferred response sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks.",
 			"JSON is optional.",
 			"",
 			`Spec:\n${specText}`,
@@ -898,22 +1110,24 @@ async function runWorkflow(
 		const implJson = extractJsonObject(implRun.finalAssistantText) ?? extractJsonObject(implRun.fullAssistantText);
 		const implNormalized = normalizeImplementationOutput(implRun.finalAssistantText || implRun.fullAssistantText, implJson);
 		state.lastImplSummary = implNormalized.implementationSummary;
-		state.lastBranchName = implNormalized.branchName ?? state.lastBranchName;
-		state.lastCommitShas = implNormalized.commitShas ?? state.lastCommitShas;
-		state.lastPrUrl = implNormalized.prUrl ?? state.lastPrUrl;
-		state.lastPrFailureReason = implNormalized.prFailureReason ?? state.lastPrFailureReason;
 		persistTask(pi, state);
 
 		recordProgress(pi, ctx, state, "review", `Reviewing implementation attempt ${state.reviewLoops}`);
 
 		const reviewPrompt = [
 			"Review the implementation against the spec, focusing on bugs, security, regressions, and missing tests.",
+			"Reviewer stage owns git integration: commit pending changes, push branch, open/update PR, and check CI status.",
+			"Run only the CI checks needed for this repo and include a concise pass/fail summary.",
 			"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-			"Preferred response sections: Approval, Blocking Findings (with severity), Fix Instructions.",
+			"Preferred response sections: Approval, Blocking Findings (with severity), Non-blocking Findings, Fix Instructions, Branch / Commits / PR, CI Status.",
 			"JSON is optional.",
+			state.codexReviewSessionId
+				? `Reuse Codex review session id: ${state.codexReviewSessionId} (use codex exec resume).`
+				: "If starting a fresh Codex review session, return codex_session_id in DECISION block.",
 			"",
 			`Spec:\n${specText}`,
 			`Implementation summary:\n${state.lastImplSummary ?? "(none)"}`,
+			`Current branch (if known):\n${state.lastBranchName ?? state.worktreeBranch ?? "(unknown)"}`,
 		].join("\n");
 		const reviewRun = await runAgent("reviewer", "review", reviewPrompt);
 		if (!reviewRun.ok) {
@@ -924,6 +1138,11 @@ async function runWorkflow(
 		const reviewJson = extractJsonObject(reviewRun.finalAssistantText) ?? extractJsonObject(reviewRun.fullAssistantText);
 		const reviewNormalized = normalizeReviewOutput(reviewRun.finalAssistantText || reviewRun.fullAssistantText, reviewJson);
 		state.blockingFindings = reviewNormalized.blockingFindings;
+		if (reviewNormalized.codexSessionId) state.codexReviewSessionId = reviewNormalized.codexSessionId;
+		state.lastBranchName = reviewNormalized.branchName ?? state.lastBranchName;
+		state.lastCommitShas = reviewNormalized.commitShas ?? state.lastCommitShas;
+		state.lastPrUrl = reviewNormalized.prUrl ?? state.lastPrUrl;
+		state.lastPrFailureReason = reviewNormalized.prFailureReason ?? state.lastPrFailureReason;
 		state.lastReviewSummary = reviewRun.finalAssistantText;
 		const reviewerApproved = reviewNormalized.approved;
 		const hasBlocking = state.blockingFindings.some((f) => f.severity === "P0" || f.severity === "P1");
@@ -932,11 +1151,58 @@ async function runWorkflow(
 			approved = true;
 			recordProgress(pi, ctx, state, "validation", "Review approved");
 		} else {
+			const onlyMinorFindings =
+				state.blockingFindings.length > 0 &&
+				state.blockingFindings.every((f) => f.severity === "P2" || f.severity === "P3");
+
+			if (!hasBlocking && onlyMinorFindings) {
+				recordProgress(
+					pi,
+					ctx,
+					state,
+					"review",
+					`Review reported only minor findings on attempt ${state.reviewLoops}; requesting implementation triage`,
+				);
+				const triagePrompt = [
+					"You are triaging non-blocking review findings.",
+					"Decide whether to fix now or defer minor issues and continue to validation.",
+					"Respond with DECISION + DETAILS.",
+					"If deferring, set DECISION loop_back_to: validation and blocking: no.",
+					"",
+					`Review findings:\n${state.blockingFindings.map((f) => `- [${f.severity}] ${f.title}: ${f.description}`).join("\n")}`,
+					`Review fix instructions:\n${reviewNormalized.fixInstructions || "(none)"}`,
+				].join("\n");
+				const triageRun = await runAgent(state.routedAgent!, "review-minor-triage", triagePrompt);
+				if (triageRun.ok) {
+					const triageNormalized = normalizeImplementationOutput(
+						triageRun.finalAssistantText || triageRun.fullAssistantText,
+						extractJsonObject(triageRun.finalAssistantText) ?? extractJsonObject(triageRun.fullAssistantText),
+					);
+					const triageLoop = (triageNormalized.decisionLoopBackTo ?? "").toLowerCase();
+					const triageBlocking = (triageNormalized.decisionBlocking ?? "").toLowerCase();
+					const triageStatus = (triageNormalized.decisionStatus ?? "").toLowerCase();
+					const deferToValidation =
+						(triageLoop === "validation" || triageStatus === "approved") &&
+						!(triageBlocking === "yes" || triageBlocking === "true");
+					if (deferToValidation) {
+						approved = true;
+						recordProgress(
+							pi,
+							ctx,
+							state,
+							"validation",
+							"Implementation triage deferred minor findings; proceeding to validation",
+						);
+						continue;
+					}
+				}
+			}
+
 			const fixInstructions = reviewNormalized.fixInstructions || "Fix reviewer findings and rerun.";
 			iterationFeedback = [
 				`Review failed on attempt ${state.reviewLoops}.`,
 				`Fix instructions: ${fixInstructions}`,
-				`Blocking findings:`,
+				`Findings:`,
 				...state.blockingFindings.map((f) => `- [${f.severity}] ${f.title}: ${f.description}`),
 			].join("\n");
 			recordProgress(pi, ctx, state, "fixing", `Review requested fixes on attempt ${state.reviewLoops}`);
@@ -1010,8 +1276,9 @@ async function runWorkflow(
 
 			const remediationPrompt = [
 				"Apply fixes required by validation failure.",
+				"Do not commit, push, or check CI in this step. The reviewer stage owns commit/push/CI.",
 				"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-				"Preferred response sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks, PR info.",
+				"Preferred response sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks.",
 				"JSON is optional.",
 				"",
 				`Spec:\n${specText}`,
@@ -1030,18 +1297,19 @@ async function runWorkflow(
 				remediationJson,
 			);
 			state.lastImplSummary = remediationNormalized.implementationSummary;
-			state.lastBranchName = remediationNormalized.branchName ?? state.lastBranchName;
-			state.lastCommitShas = remediationNormalized.commitShas ?? state.lastCommitShas;
-			state.lastPrUrl = remediationNormalized.prUrl ?? state.lastPrUrl;
-			state.lastPrFailureReason = remediationNormalized.prFailureReason ?? state.lastPrFailureReason;
 			persistTask(pi, state);
 
 			recordProgress(pi, ctx, state, "review", `Reviewing validation remediation attempt ${state.reviewLoops}`);
 			const remediationReviewPrompt = [
 				"Review this validation-remediation implementation.",
+				"Reviewer stage owns git integration: commit pending changes, push branch, open/update PR, and check CI status.",
+				"Run only the CI checks needed for this repo and include a concise pass/fail summary.",
 				"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-				"Preferred response sections: Approval, Blocking Findings (with severity), Fix Instructions.",
+				"Preferred response sections: Approval, Blocking Findings (with severity), Non-blocking Findings, Fix Instructions, Branch / Commits / PR, CI Status.",
 				"JSON is optional.",
+				state.codexReviewSessionId
+					? `Reuse Codex review session id: ${state.codexReviewSessionId} (use codex exec resume).`
+					: "If starting a fresh Codex review session, return codex_session_id in DECISION block.",
 				"",
 				`Spec:\n${specText}`,
 				`Implementation summary:\n${state.lastImplSummary ?? "(none)"}`,
@@ -1060,6 +1328,13 @@ async function runWorkflow(
 				remediationReviewRun.finalAssistantText || remediationReviewRun.fullAssistantText,
 				remediationReviewJson,
 			);
+			if (remediationReviewNormalized.codexSessionId) {
+				state.codexReviewSessionId = remediationReviewNormalized.codexSessionId;
+			}
+			state.lastBranchName = remediationReviewNormalized.branchName ?? state.lastBranchName;
+			state.lastCommitShas = remediationReviewNormalized.commitShas ?? state.lastCommitShas;
+			state.lastPrUrl = remediationReviewNormalized.prUrl ?? state.lastPrUrl;
+			state.lastPrFailureReason = remediationReviewNormalized.prFailureReason ?? state.lastPrFailureReason;
 			state.blockingFindings = remediationReviewNormalized.blockingFindings;
 			const remediationApproved = remediationReviewNormalized.approved;
 			const remediationHasBlocking = state.blockingFindings.some((f) => f.severity === "P0" || f.severity === "P1");
@@ -1101,7 +1376,7 @@ async function runWorkflow(
 	recordProgress(pi, ctx, state, "done", "Workflow completed");
 
 	const reportMarkdown = buildReportMarkdown(state, reporterOutput);
-	saveFinalArtifacts(ctx.cwd, state, reportMarkdown);
+	saveFinalArtifacts(state.repoPath, state, reportMarkdown);
 	persistTask(pi, state);
 	await sendReportToMainAgentWebhook(state);
 
@@ -1113,19 +1388,21 @@ function parseTitle(task: string): string {
 	return oneLine.length > 96 ? `${oneLine.slice(0, 93)}...` : oneLine;
 }
 
-function createTask(taskInput: string): TaskState {
+function createTask(taskInput: string, cwd: string): TaskState {
 	const created = nowIso();
+	const repoPath = deriveRepoPathFromTask(taskInput, cwd);
 	return {
 		id: `task-${Date.now()}-${randomUUID().slice(0, 8)}`,
 		title: parseTitle(taskInput),
 		originalTask: taskInput.trim(),
+		repoPath,
 		status: "queued",
 		stage: "received",
 		createdAt: created,
 		updatedAt: created,
 		reviewLoops: 0,
 		validationLoops: 0,
-		maxReviewLoops: 6,
+		maxReviewLoops: 3,
 		maxValidationLoops: 3,
 		blockingFindings: [],
 		validationIssues: [],
@@ -1214,7 +1491,7 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(`Task ${activeTaskId} is already running. Use /orchestrate-status`, "warning");
 				return;
 			}
-			const state = createTask(taskInput);
+			const state = createTask(taskInput, ctx.cwd);
 			activeTaskId = state.id;
 			try {
 				await handleRun(pi, ctx, state, tasks);
@@ -1293,7 +1570,7 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(`Task not found: ${taskId}`, "warning");
 				return;
 			}
-			const traceDir = task.traceDir ?? getTraceDir(ctx.cwd, task);
+			const traceDir = task.traceDir ?? getTraceDir(task.repoPath, task);
 			if (!fs.existsSync(traceDir)) {
 				ctx.ui.notify(`No trace directory yet: ${traceDir}`, "info");
 				return;
@@ -1331,6 +1608,7 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 			}
 			const state: TaskState = {
 				...fromSession,
+				repoPath: fromSession.repoPath ?? ctx.cwd,
 				status: "queued",
 				updatedAt: nowIso(),
 			};
