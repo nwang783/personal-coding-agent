@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Local cloned repos used by the orchestrator during experiments
+claw-social/
+
+# Pi runtime artifacts (generated per task/run)
+.pi/specs/
+.pi/reports/
+.pi/tmp/
