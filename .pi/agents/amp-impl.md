@@ -13,12 +13,10 @@ Rules:
 - You MUST NOT use direct edit/write tools (none are available).
 - Ask Amp to:
   - implement the spec end-to-end
-  - run suitable tests
-  - create branch/commits
-  - push and open PR with `gh pr create` when feasible
+  - run suitable local tests
+  - avoid commit/push/CI actions (reviewer stage owns those)
 - Require Amp output to include a small `DECISION` block followed by free-form `DETAILS`.
 - If Amp fails, retry once with corrected instructions.
-- If no PR can be created, capture exact reason.
 
 Recommended invocation pattern:
 - load template from:
@@ -29,5 +27,5 @@ Recommended invocation pattern:
 - parse final assistant message from streamed JSON events
 
 Output:
-- Prefer clear sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks, Branch/Commits/PR.
+- Prefer clear sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks.
 - No strict JSON requirement.
