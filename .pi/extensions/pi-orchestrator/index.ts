@@ -83,6 +83,43 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
+function expandHome(input: string): string {
+	if (!input.startsWith("~")) return input;
+	const home = process.env.HOME;
+	if (!home) return input;
+	if (input === "~") return home;
+	if (input.startsWith("~/")) return path.join(home, input.slice(2));
+	return input;
+}
+
+function isGitRepoRoot(candidate: string): boolean {
+	try {
+		const stat = fs.statSync(candidate);
+		if (!stat.isDirectory()) return false;
+		return fs.existsSync(path.join(candidate, ".git"));
+	} catch {
+		return false;
+	}
+}
+
+function deriveRepoPathFromTask(taskInput: string, fallbackCwd: string): string {
+	const candidates = new Set<string>();
+	const raw = taskInput.trim();
+
+	for (const match of raw.matchAll(/\((~?\/[^)]+)\)/g)) {
+		candidates.add(match[1]);
+	}
+	for (const match of raw.matchAll(/\b(~\/[^\s"')]+|\/[^\s"')]+)\b/g)) {
+		candidates.add(match[1]);
+	}
+
+	for (const candidate of candidates) {
+		const resolved = path.resolve(expandHome(candidate));
+		if (isGitRepoRoot(resolved)) return resolved;
+	}
+	return fallbackCwd;
+}
+
 function getSubagentTimeoutMs(): number {
 	const raw = process.env.PI_ORCHESTRATOR_SUBAGENT_TIMEOUT_MS;
 	const parsed = raw ? Number(raw) : NaN;
@@ -244,6 +281,8 @@ function normalizeSpecOutput(
 	acceptanceCriteria: string[];
 	complexitySignals: string[];
 	implementationNotes: string[];
+	implementationPhases: string[];
+	phaseCompletionChecks: string[];
 } {
 	if (specJson) {
 		return {
@@ -258,6 +297,12 @@ function normalizeSpecOutput(
 			implementationNotes: Array.isArray(specJson.implementationNotes)
 				? specJson.implementationNotes.map((x) => String(x))
 				: [],
+			implementationPhases: Array.isArray(specJson.implementationPhases)
+				? specJson.implementationPhases.map((x) => String(x))
+				: [],
+			phaseCompletionChecks: Array.isArray(specJson.phaseCompletionChecks)
+				? specJson.phaseCompletionChecks.map((x) => String(x))
+				: [],
 		};
 	}
 
@@ -269,7 +314,23 @@ function normalizeSpecOutput(
 	const acceptanceCriteria = extractBullets(extractSection(rawText, "Acceptance Criteria"));
 	const complexitySignals = extractBullets(extractSection(rawText, "Complexity Signals"));
 	const implementationNotes = extractBullets(extractSection(rawText, "Implementation Notes"));
-	return { goal, constraints, acceptanceCriteria, complexitySignals, implementationNotes };
+	const implementationPhasesPrimary = extractBullets(extractSection(rawText, "Implementation Phases"));
+	const implementationPhasesFallback = extractBullets(extractSection(rawText, "Phases"));
+	const implementationPhases =
+		implementationPhasesPrimary.length > 0 ? implementationPhasesPrimary : implementationPhasesFallback;
+	const phaseCompletionChecksPrimary = extractBullets(extractSection(rawText, "Phase Completion Checks"));
+	const phaseCompletionChecksFallback = extractBullets(extractSection(rawText, "Completion Checks"));
+	const phaseCompletionChecks =
+		phaseCompletionChecksPrimary.length > 0 ? phaseCompletionChecksPrimary : phaseCompletionChecksFallback;
+	return {
+		goal,
+		constraints,
+		acceptanceCriteria,
+		complexitySignals,
+		implementationNotes,
+		implementationPhases,
+		phaseCompletionChecks,
+	};
 }
 
 function normalizeImplementationOutput(
@@ -438,8 +499,22 @@ function renderSpecMarkdown(
 		acceptanceCriteria: string[];
 		complexitySignals: string[];
 		implementationNotes: string[];
+		implementationPhases: string[];
+		phaseCompletionChecks: string[];
 	},
 ): string {
+	const phases =
+		specData.implementationPhases.length > 0
+			? specData.implementationPhases
+			: ["Phase 1: Foundation", "Phase 2: Implementation", "Phase 3: Verification and Handoff"];
+	const checks =
+		specData.phaseCompletionChecks.length > 0
+			? specData.phaseCompletionChecks
+			: [
+					"Phase 1 artifacts created and wired (types/modules/hooks/interfaces).",
+					"Phase 2 feature behavior implemented and integrated in target surfaces.",
+					"Phase 3 tests pass and manual verification evidence is captured.",
+				];
 	return [
 		`# Spec: ${task.title}`,
 		"",
@@ -461,6 +536,12 @@ function renderSpecMarkdown(
 		"",
 		"## Complexity Signals",
 		...specData.complexitySignals.map((x) => `- ${x}`),
+		"",
+		"## Implementation Phases",
+		...phases.map((x, i) => `${i + 1}. ${x}`),
+		"",
+		"## Phase Completion Checks",
+		...checks.map((x) => `- [ ] ${x}`),
 		"",
 		"## Implementation Notes",
 		...specData.implementationNotes.map((x) => `- ${x}`),
@@ -973,9 +1054,11 @@ async function runWorkflow(
 		const specPrompt = [
 			"Create the central implementation spec for this task.",
 			"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-			"Preferred format: Goal, Constraints, Acceptance Criteria, Complexity Signals, Implementation Notes.",
+			"Preferred format: Goal, Constraints, Acceptance Criteria, Complexity Signals, Implementation Phases, Phase Completion Checks, Implementation Notes.",
+			"The spec should be implementation-oriented and phase-driven, with clear completion checks.",
 			"JSON is optional.",
 			"",
+			`Target repository root path:\n${state.repoPath}`,
 			`User task:\n${state.originalTask}`,
 		].join("\n");
 		const specRun = await runAgent("spec-writer", "spec-generation", specPrompt);
@@ -1307,11 +1390,12 @@ function parseTitle(task: string): string {
 
 function createTask(taskInput: string, cwd: string): TaskState {
 	const created = nowIso();
+	const repoPath = deriveRepoPathFromTask(taskInput, cwd);
 	return {
 		id: `task-${Date.now()}-${randomUUID().slice(0, 8)}`,
 		title: parseTitle(taskInput),
 		originalTask: taskInput.trim(),
-		repoPath: cwd,
+		repoPath,
 		status: "queued",
 		stage: "received",
 		createdAt: created,

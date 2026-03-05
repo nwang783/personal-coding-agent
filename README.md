@@ -87,7 +87,7 @@ Runtime prompt guardrails injected into every subagent system prompt:
 - explicit instruction not to clone the repo again
 
 Repository path derivation:
-- `repoPath` is captured deterministically from the Pi session cwd when `/orchestrate` is started.
+- `repoPath` is derived from an explicit repository path in the task text when present (for example `~/Projects/claw-social`), otherwise it falls back to the Pi session cwd.
 - That path is written into task state and into the generated spec metadata.
 - All later stages read from task state, not transient cwd.
 
