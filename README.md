@@ -25,12 +25,15 @@ Spec generation, implementation, and review are dispatcher-based: Pi subagents c
    - `/orchestrate-status`
    - `/orchestrate-log <task-id>`
    - `/orchestrate-trace <task-id>`
-   - `/orchestrate-widget <compact|spec|prompt|result|history>`
+   - `/orchestrate-tail <task-id>`
+   - `/orchestrate-widget <compact|spec|prompt|result|history|stream>`
    - live widget now shows:
      - spec file path + preview
      - active subagent + purpose
      - prompt file path + prompt preview
      - result file path
+     - dispatched subagent command preview
+     - real-time streamed events from delegated agents (`stream` mode)
 5. Resume a failed/interrupted task:
    - `/orchestrate-resume <task-id>`
 
@@ -40,8 +43,8 @@ Spec generation, implementation, and review are dispatcher-based: Pi subagents c
 - Final reports:
   - `.pi/reports/<task-id>.json`
   - `.pi/reports/<task-id>.md`
-  - `.pi/reports/<task-id>.live.log` (stage-by-stage live progress)
-  - `.pi/reports/<task-id>.trace/` (exact subagent prompts/results)
+  - `.pi/reports/<task-id>.live.log` (stage-by-stage plus stream events)
+  - `.pi/reports/<task-id>.trace/` (exact subagent prompts/results + per-call meta)
 - Per-task isolated worktrees:
   - `.pi/worktrees/<task-id>/`
 
