@@ -12,6 +12,10 @@ Autonomous dispatcher extension for Pi.dev:
 
 - `/orchestrate <task>`
 - `/orchestrate-status`
+- `/orchestrate-log <task-id>`
+- `/orchestrate-trace <task-id>`
+- `/orchestrate-tail <task-id>`
+- `/orchestrate-widget <compact|spec|prompt|result|history|stream>`
 - `/orchestrate-resume <task-id>`
 
 ## Artifacts
@@ -19,6 +23,8 @@ Autonomous dispatcher extension for Pi.dev:
 - `.pi/specs/<task-id>.md`
 - `.pi/reports/<task-id>.json`
 - `.pi/reports/<task-id>.md`
+- `.pi/reports/<task-id>.live.log` (includes stage updates and streamed subagent events)
+- `.pi/reports/<task-id>.trace/` (prompt/result/meta files per subagent call)
 
 ## Optional callback
 

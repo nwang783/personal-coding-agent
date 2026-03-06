@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -60,6 +61,10 @@ type TaskState = {
 	activeAgentPurpose?: string;
 	lastPromptPath?: string;
 	lastResultPath?: string;
+	lastSubagentCommand?: string;
+	lastStreamEvent?: string;
+	streamEvents?: Array<{ at: string; agent: string; purpose: string; kind: string; text: string }>;
+	widgetMode?: WidgetMode;
 };
 
 type AgentConfig = {
@@ -77,6 +82,10 @@ type SubagentRun = {
 	stderr: string;
 	finalAssistantText: string;
 	fullAssistantText: string;
+	eventCount: number;
+	toolEventCount: number;
+	deltaCount: number;
+	durationMs: number;
 };
 
 function nowIso(): string {
@@ -248,24 +257,24 @@ function parseDecisionBlock(text: string): Record<string, string> {
 	for (const raw of lines) {
 		const line = raw.trim();
 		if (!inDecision) {
-			if (/^decision\s*:/i.test(line)) {
+			if (/^\s{0,3}#{1,6}\s*decision\b/i.test(line) || /^decision\b\s*:?\s*$/i.test(line)) {
 				inDecision = true;
 			}
 			continue;
 		}
 		if (!line) continue;
-		if (/^[A-Za-z][A-Za-z0-9 _-]{1,40}\s*:\s*$/.test(line) && !/^-/.test(line)) {
+		if (/^\s{0,3}#{1,6}\s+/.test(line) && !/^\s{0,3}#{1,6}\s*decision\b/i.test(line)) {
 			break;
 		}
-		const item = line.replace(/^-\s*/, "");
-		const idx = item.indexOf(":");
-		if (idx === -1) continue;
-		const key = item
-			.slice(0, idx)
+		const item = line.replace(/^[-*]\s*/, "").trim();
+		const pair = item.match(/^(?:\*\*|__)?([A-Za-z][A-Za-z0-9 _-]{1,40})(?:\*\*|__)?\s*:\s*(.+)$/);
+		if (!pair) continue;
+		const key = pair[1]
 			.trim()
 			.toLowerCase()
 			.replace(/\s+/g, "_");
-		const value = item.slice(idx + 1).trim();
+		let value = pair[2].trim();
+		value = value.replace(/^`+|`+$/g, "");
 		if (key && value) out[key] = value;
 	}
 	return out;
@@ -439,7 +448,7 @@ function normalizeReviewOutput(
 	const approved = parseYesNo(
 		decision.status ?? rawText,
 		[/\bapproved\b/i, /\bpasses?\b/i, /\bno (critical|blocking) issues?\b/i],
-		[/\bnot approved\b/i, /\bfail(?:ed|s)?\b/i, /\bblocking\b/i],
+		[/\bnot approved\b/i, /\bfail(?:ed|s)?\b/i, /\bneeds_changes\b/i],
 		findings.length === 0,
 	);
 	const branchName = rawText.match(/branch(?:\s*name)?\s*[:=-]\s*([A-Za-z0-9._/-]+)/i)?.[1];
@@ -596,14 +605,13 @@ function summarizeState(state: TaskState): string {
 }
 
 async function runSubagent(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
 	agent: AgentConfig,
 	taskPrompt: string,
 	runCwd: string,
 	repoRootPath: string,
 	worktreePath: string,
 	worktreeBranch: string | undefined,
+	onStreamEvent?: (kind: string, text: string) => void,
 ): Promise<SubagentRun> {
 	const args = ["--mode", "json", "-p", "--no-session"];
 	if (agent.model) args.push("--model", agent.model);
@@ -612,7 +620,7 @@ async function runSubagent(
 	let promptFile: string | undefined;
 	try {
 		if (agent.systemPrompt.trim()) {
-			const tempDir = path.join(ctx.cwd, ".pi", "tmp");
+			const tempDir = path.join(repoRootPath, ".pi", "tmp");
 			ensureDir(tempDir);
 			promptFile = path.join(tempDir, `orchestrator-prompt-${safeFilename(agent.name)}-${Date.now()}.md`);
 			const runtimeGuardrails = [
@@ -630,39 +638,135 @@ async function runSubagent(
 		}
 		args.push(`Task: ${taskPrompt}`);
 
-		const result = await pi.exec("pi", args, { timeout: getSubagentTimeoutMs(), cwd: runCwd });
 		const assistantChunks: string[] = [];
 		let finalAssistantText = "";
-
-		for (const line of result.stdout.split("\n")) {
-			if (!line.trim()) continue;
+		let stderr = "";
+		let eventCount = 0;
+		let toolEventCount = 0;
+		let deltaCount = 0;
+		let pendingDelta = "";
+		let stdoutBuffer = "";
+		const flushDelta = (): void => {
+			const text = pendingDelta.trim();
+			if (!text) return;
+			pendingDelta = "";
+			onStreamEvent?.("assistant_delta", text);
+		};
+		const parseLine = (line: string): void => {
+			if (!line.trim()) return;
 			try {
 				const event = JSON.parse(line) as Record<string, unknown>;
-				if (event.type !== "message_end") continue;
-				const msg = event.message as Record<string, unknown> | undefined;
-				if (!msg || msg.role !== "assistant") continue;
-				const content = msg.content as Array<Record<string, unknown>> | undefined;
-				if (!content) continue;
-				const text = content
-					.filter((c) => c.type === "text")
-					.map((c) => String(c.text ?? ""))
-					.join("\n")
-					.trim();
-				if (text) {
-					assistantChunks.push(text);
-					finalAssistantText = text;
+				const eventType = String(event.type ?? "");
+				if (eventType && eventType !== "session") eventCount += 1;
+				if (eventType === "message_update") {
+					const assistantMessageEvent = event.assistantMessageEvent as Record<string, unknown> | undefined;
+					if (assistantMessageEvent?.type === "text_delta") {
+						const delta = String(assistantMessageEvent.delta ?? "");
+						if (delta) {
+							deltaCount += 1;
+							pendingDelta += delta;
+							if (pendingDelta.length >= 160 || pendingDelta.includes("\n")) {
+								flushDelta();
+							}
+						}
+					}
+					return;
+				}
+				if (eventType === "tool_execution_start") {
+					toolEventCount += 1;
+					onStreamEvent?.(
+						"tool_start",
+						`start ${String(event.toolName ?? "tool")} ${JSON.stringify(event.args ?? {})}`.slice(0, 320),
+					);
+					return;
+				}
+				if (eventType === "tool_execution_end") {
+					toolEventCount += 1;
+					const resultPreview = JSON.stringify(event.result ?? "").slice(0, 220);
+					onStreamEvent?.(
+						"tool_end",
+						`end ${String(event.toolName ?? "tool")} error=${Boolean(event.isError)} result=${resultPreview}`,
+					);
+					return;
+				}
+				if (eventType === "auto_retry_start") {
+					onStreamEvent?.(
+						"retry",
+						`auto retry ${String(event.attempt ?? "?")}/${String(event.maxAttempts ?? "?")} delay=${String(event.delayMs ?? "?")}ms`,
+					);
+					return;
+				}
+				if (eventType === "message_end") {
+					const msg = event.message as Record<string, unknown> | undefined;
+					if (!msg || msg.role !== "assistant") return;
+					const content = msg.content as Array<Record<string, unknown>> | undefined;
+					if (!content) return;
+					const text = content
+						.filter((c) => c.type === "text")
+						.map((c) => String(c.text ?? ""))
+						.join("\n")
+						.trim();
+					if (text) {
+						assistantChunks.push(text);
+						finalAssistantText = text;
+						onStreamEvent?.("assistant_message_end", text.slice(0, 320));
+					}
 				}
 			} catch {
-				// ignore line parse errors
+				// ignore parse errors and non-JSON lines
 			}
-		}
+		};
+
+		const started = Date.now();
+		const result = await new Promise<{ code: number; stderr: string }>((resolve) => {
+			const timeoutMs = getSubagentTimeoutMs();
+			const child = spawn("pi", args, { cwd: runCwd, stdio: ["ignore", "pipe", "pipe"] });
+			let done = false;
+			const complete = (code: number, err: string): void => {
+				if (done) return;
+				done = true;
+				resolve({ code, stderr: err });
+			};
+			const timeout = setTimeout(() => {
+				onStreamEvent?.("timeout", `subagent exceeded timeout after ${Math.floor(timeoutMs / 1000)}s`);
+				child.kill("SIGTERM");
+				setTimeout(() => child.kill("SIGKILL"), 5_000);
+			}, timeoutMs);
+			child.stdout.on("data", (chunk) => {
+				stdoutBuffer += chunk.toString("utf-8");
+				let idx = stdoutBuffer.indexOf("\n");
+				while (idx !== -1) {
+					const line = stdoutBuffer.slice(0, idx).trimEnd();
+					stdoutBuffer = stdoutBuffer.slice(idx + 1);
+					parseLine(line);
+					idx = stdoutBuffer.indexOf("\n");
+				}
+			});
+			child.stderr.on("data", (chunk) => {
+				stderr += chunk.toString("utf-8");
+			});
+			child.on("error", (err) => {
+				clearTimeout(timeout);
+				complete(1, `${stderr}\n${err.message}`.trim());
+			});
+			child.on("close", (code) => {
+				clearTimeout(timeout);
+				if (stdoutBuffer.trim()) parseLine(stdoutBuffer.trim());
+				flushDelta();
+				complete(code ?? 1, stderr.trim());
+			});
+		});
 
 		return {
 			ok: result.code === 0,
 			exitCode: result.code,
-			stderr: result.stderr,
+			stderr: result.stderr || stderr.trim(),
 			finalAssistantText,
 			fullAssistantText: assistantChunks.join("\n\n"),
+			eventCount,
+			toolEventCount,
+			deltaCount,
+			durationMs: Date.now() - started,
 		};
 	} finally {
 		if (promptFile && fs.existsSync(promptFile)) {
@@ -739,15 +843,86 @@ function previewFile(filePath: string | undefined, maxLines: number, maxCharsPer
 		return fs
 			.readFileSync(filePath, "utf-8")
 			.split("\n")
-			slice(0, maxLines)
-			map((line) => (line.length > maxCharsPerLine ? `${line.slice(0, maxCharsPerLine - 3)}...` : line));
+			.slice(0, maxLines)
+			.map((line) => (line.length > maxCharsPerLine ? `${line.slice(0, maxCharsPerLine - 3)}...` : line));
 	} catch {
 		return [];
 	}
 }
 
-type WidgetMode = "compact" | "spec" | "prompt" | "result" | "history";
+function parseStreamEventsFromLiveLog(
+	liveLogPath: string,
+	limit: number,
+): Array<{ at: string; agent: string; purpose: string; kind: string; text: string }> {
+	if (!fs.existsSync(liveLogPath)) return [];
+	try {
+		const lines = fs
+			.readFileSync(liveLogPath, "utf-8")
+			.split("\n")
+			.filter(Boolean);
+		const out: Array<{ at: string; agent: string; purpose: string; kind: string; text: string }> = [];
+		for (const line of lines) {
+			const match = line.match(
+				/^(\d{4}-\d{2}-\d{2}T[^ ]+)\s+\[stream:([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)\]\s+([\s\S]+)$/,
+			);
+			if (!match) continue;
+			out.push({
+				at: match[1],
+				agent: match[2],
+				purpose: "",
+				kind: match[3],
+				text: match[4].trim(),
+			});
+		}
+		return out.slice(-limit);
+	} catch {
+		return [];
+	}
+}
+
+type WidgetMode = "compact" | "spec" | "prompt" | "result" | "history" | "stream";
 let widgetMode: WidgetMode = "compact";
+const widgetModes: WidgetMode[] = ["compact", "spec", "prompt", "result", "history", "stream"];
+
+function getWidgetModePath(repoPath: string): string {
+	const reportDir = path.join(repoPath, ".pi", "reports");
+	ensureDir(reportDir);
+	return path.join(reportDir, "orchestrator-widget-mode.txt");
+}
+
+function parseWidgetMode(raw: string | undefined): WidgetMode | undefined {
+	if (!raw) return undefined;
+	const mode = raw.trim().toLowerCase() as WidgetMode;
+	return widgetModes.includes(mode) ? mode : undefined;
+}
+
+function readWidgetMode(repoPath: string, worktreePath?: string, fallbackCwd?: string): WidgetMode {
+	const envMode = parseWidgetMode(process.env.PI_ORCHESTRATOR_WIDGET_MODE);
+	if (envMode) return envMode;
+	const candidateBases = [repoPath, worktreePath, fallbackCwd].filter(
+		(x): x is string => typeof x === "string" && x.length > 0,
+	);
+	for (const base of candidateBases) {
+		const modePath = getWidgetModePath(base);
+		try {
+			const raw = fs.readFileSync(modePath, "utf-8");
+			const parsed = parseWidgetMode(raw);
+			if (parsed) return parsed;
+		} catch {
+			// ignore missing/invalid mode file
+		}
+	}
+	return widgetMode;
+}
+
+function writeWidgetMode(mode: WidgetMode, repoPaths: string[]): void {
+	widgetMode = mode;
+	process.env.PI_ORCHESTRATOR_WIDGET_MODE = mode;
+	for (const repoPath of repoPaths) {
+		const modePath = getWidgetModePath(repoPath);
+		fs.writeFileSync(modePath, `${mode}\n`, "utf-8");
+	}
+}
 
 function shortenMiddle(input: string, max = 88): string {
 	if (input.length <= max) return input;
@@ -772,6 +947,12 @@ function buildPanelPreview(
 
 function refreshLiveUi(ctx: ExtensionContext, state: TaskState): void {
 	const th = ctx.ui.theme;
+	const currentWidgetMode = readWidgetMode(state.repoPath, state.worktreePath, ctx.cwd);
+	state.widgetMode = currentWidgetMode;
+	const liveLogPath = getLiveLogPath(state.repoPath, state);
+	if (!state.streamEvents || state.streamEvents.length === 0) {
+		state.streamEvents = parseStreamEventsFromLiveLog(liveLogPath, 80);
+	}
 	const latest = state.history[state.history.length - 1];
 	const statusNote = latest ? ` | ${latest.note}` : "";
 	const statusColor =
@@ -783,45 +964,48 @@ function refreshLiveUi(ctx: ExtensionContext, state: TaskState): void {
 
 	const header: string[] = [
 		th.fg("accent", "Pi Orchestrator"),
-		`${th.fg("muted", "Task")} ${th.fg("accent", state.id)}`,
 		`${th.fg("muted", "Status")} ${th.fg(statusColor, state.status)}  ${th.fg("muted", "Stage")} ${th.fg("warning", state.stage)}`,
 		`${th.fg("muted", "Loops")} R ${state.reviewLoops}/${state.maxReviewLoops} | V ${state.validationLoops}/${state.maxValidationLoops}`,
-		`${th.fg("muted", "Repo")} ${th.fg("accent", shortenMiddle(state.worktreePath ?? state.repoPath, 96))}`,
-		`${th.fg("muted", "Branch")} ${th.fg("accent", state.worktreeBranch ?? "(unknown)")}`,
 		`${th.fg("muted", "Agent")} ${state.activeAgentName ? th.fg("success", state.activeAgentName) : th.fg("dim", "idle")} ${th.fg("dim", state.activeAgentPurpose ? `(${state.activeAgentPurpose})` : "")}`,
-		`${th.fg("muted", "View")} ${th.fg("accent", widgetMode)} ${th.fg("dim", "(switch: /orchestrate-widget <compact|spec|prompt|result|history>)")}`,
+		`${th.fg("muted", "View")} ${th.fg("accent", currentWidgetMode)} ${th.fg("dim", "(switch: /orchestrate-widget <compact|spec|prompt|result|history|stream>)")}`,
 	];
 
 	const body: string[] = [];
-	if (widgetMode === "compact") {
-		const hist = state.history.slice(-4).map((h) => `${th.fg("dim", h.at.slice(11, 19))} ${th.fg("warning", `[${h.stage}]`)} ${h.note}`);
+	if (currentWidgetMode === "compact") {
+		const hist = state.history.slice(-2).map((h) => `${th.fg("dim", h.at.slice(11, 19))} ${th.fg("warning", `[${h.stage}]`)} ${h.note}`);
 		body.push(
 			`${th.fg("muted", "Spec")} ${th.fg("accent", shortenMiddle(state.specPath ?? "(none)", 92))}`,
 			`${th.fg("muted", "Prompt")} ${th.fg("accent", shortenMiddle(state.lastPromptPath ?? "(none)", 90))}`,
 			`${th.fg("muted", "Result")} ${th.fg("accent", shortenMiddle(state.lastResultPath ?? "(none)", 90))}`,
+			`${th.fg("muted", "Command")} ${th.fg("accent", shortenMiddle(state.lastSubagentCommand ?? "(none)", 90))}`,
+			`${th.fg("muted", "Stream")} ${th.fg("accent", shortenMiddle(state.lastStreamEvent ?? "(none)", 90))}`,
 			th.fg("muted", "Recent"),
 			...hist,
 		);
-	} else if (widgetMode === "spec") {
-		body.push(...buildPanelPreview("Spec", state.specPath, 10, th));
-	} else if (widgetMode === "prompt") {
-		body.push(...buildPanelPreview("Prompt", state.lastPromptPath, 12, th));
-	} else if (widgetMode === "result") {
-		body.push(...buildPanelPreview("Result", state.lastResultPath, 12, th));
+	} else if (currentWidgetMode === "spec") {
+		body.push(...buildPanelPreview("Spec", state.specPath, 6, th));
+	} else if (currentWidgetMode === "prompt") {
+		body.push(...buildPanelPreview("Prompt", state.lastPromptPath, 6, th));
+	} else if (currentWidgetMode === "result") {
+		body.push(...buildPanelPreview("Result", state.lastResultPath, 6, th));
+	} else if (currentWidgetMode === "stream") {
+		const streamLines = (state.streamEvents ?? []).slice(-8).map((e) => {
+			const t = e.at.slice(11, 19);
+			return `${th.fg("dim", t)} ${th.fg("success", `[${e.agent}]`)} ${th.fg("warning", e.kind)} ${e.text}`;
+		});
+		body.push(
+			th.fg("muted", "Agent stream:"),
+			...(streamLines.length > 0 ? streamLines : [th.fg("dim", "(no stream events yet)")]),
+		);
 	} else {
 		body.push(
 			th.fg("muted", "History:"),
-			...state.history.slice(-18).map((h) => `${th.fg("dim", h.at)} ${th.fg("warning", `[${h.stage}]`)} ${h.note}`),
+			...state.history.slice(-8).map((h) => `${th.fg("dim", h.at)} ${th.fg("warning", `[${h.stage}]`)} ${h.note}`),
 		);
 	}
 
 	ctx.ui.setWidget("pi-orchestrator-progress", [...header, "", ...body]);
-	const quickActions = [
-		th.fg("muted", "Quick actions:"),
-		"  /orchestrate-status",
-		`  /orchestrate-log ${state.id}`,
-		`  /orchestrate-trace ${state.id}`,
-	];
+	const quickActions = [th.fg("muted", `Quick: /orchestrate-log ${state.id} | /orchestrate-trace ${state.id} | /orchestrate-tail ${state.id}`)];
 	ctx.ui.setWidget("pi-orchestrator-actions", quickActions, { placement: "belowEditor" });
 }
 
@@ -854,6 +1038,9 @@ function loadPersistedTasks(ctx: ExtensionContext): Map<string, TaskState> {
 			repoPath: e.data.repoPath ?? ctx.cwd,
 			maxReviewLoops: e.data.maxReviewLoops ?? 3,
 			maxValidationLoops: e.data.maxValidationLoops ?? 3,
+			widgetMode:
+				e.data.widgetMode ??
+				readWidgetMode(e.data.repoPath ?? ctx.cwd, e.data.worktreePath, ctx.cwd),
 		});
 	}
 	return tasks;
@@ -968,6 +1155,8 @@ async function runWorkflow(
 		state.activeAgentPurpose = purpose;
 		state.lastPromptPath = promptPath;
 		state.lastResultPath = undefined;
+		const selectedAgent = getAgent(agentName);
+		state.lastSubagentCommand = `pi --mode json -p --no-session${selectedAgent.model ? ` --model ${selectedAgent.model}` : ""}${selectedAgent.tools && selectedAgent.tools.length > 0 ? ` --tools ${selectedAgent.tools.join(",")}` : ""} --append-system-prompt <temp> "Task: ..."`;
 		persistTask(pi, state);
 		refreshLiveUi(ctx, state);
 		recordProgress(pi, ctx, state, state.stage, `Dispatching ${agentName} (${purpose})`);
@@ -977,15 +1166,30 @@ async function runWorkflow(
 			const secs = Math.floor((Date.now() - started) / 1000);
 			recordProgress(pi, ctx, state, state.stage, `Waiting on ${agentName} (${purpose}) for ${secs}s`);
 		}, 60_000);
+		let lastUiRefreshMs = 0;
 		const run = await runSubagent(
-			pi,
-			ctx,
-			getAgent(agentName),
+			selectedAgent,
 			contextualPrompt,
 			executionPath,
 			state.repoPath,
 			executionPath,
 			state.worktreeBranch,
+			(kind, text) => {
+				const at = nowIso();
+				const normalizedText = text.replace(/\s+/g, " ").trim().slice(0, 260);
+				const item = { at, agent: agentName, purpose, kind, text: normalizedText };
+				const next = [...(state.streamEvents ?? []), item];
+				state.streamEvents = next.slice(-80);
+				state.lastStreamEvent = `[${agentName}] ${kind} ${normalizedText}`;
+				const liveLogPath = getLiveLogPath(state.repoPath, state);
+				fs.appendFileSync(liveLogPath, `${at} [stream:${agentName}:${kind}] ${normalizedText}\n`, "utf-8");
+				const now = Date.now();
+				if (now - lastUiRefreshMs >= 1200) {
+					lastUiRefreshMs = now;
+					persistTask(pi, state);
+					refreshLiveUi(ctx, state);
+				}
+			},
 		).finally(() => {
 			clearInterval(heartbeat);
 		});
@@ -996,6 +1200,10 @@ async function runWorkflow(
 			`- Purpose: ${purpose}`,
 			`- Exit Code: ${run.exitCode}`,
 			`- OK: ${run.ok}`,
+			`- DurationMs: ${run.durationMs}`,
+			`- Event Count: ${run.eventCount}`,
+			`- Delta Count: ${run.deltaCount}`,
+			`- Tool Event Count: ${run.toolEventCount}`,
 			"",
 			"## Final Assistant Text",
 			run.finalAssistantText || "(empty)",
@@ -1023,6 +1231,11 @@ async function runWorkflow(
 					resultPath,
 					ok: run.ok,
 					exitCode: run.exitCode,
+					durationMs: run.durationMs,
+					eventCount: run.eventCount,
+					deltaCount: run.deltaCount,
+					toolEventCount: run.toolEventCount,
+					command: state.lastSubagentCommand,
 				},
 				null,
 				2,
@@ -1518,15 +1731,21 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("orchestrate-widget", {
-		description: "Set widget view mode: /orchestrate-widget <compact|spec|prompt|result|history>",
+		description: "Set widget view mode: /orchestrate-widget <compact|spec|prompt|result|history|stream>",
 		handler: async (args, ctx) => {
 			const mode = ((args ?? "").trim().toLowerCase() || "compact") as WidgetMode;
-			const allowed: WidgetMode[] = ["compact", "spec", "prompt", "result", "history"];
-			if (!allowed.includes(mode)) {
-				ctx.ui.notify("Usage: /orchestrate-widget <compact|spec|prompt|result|history>", "warning");
+			if (!widgetModes.includes(mode)) {
+				ctx.ui.notify("Usage: /orchestrate-widget <compact|spec|prompt|result|history|stream>", "warning");
 				return;
 			}
-			widgetMode = mode;
+			const repoPaths = new Set<string>([ctx.cwd]);
+			for (const task of tasks.values()) {
+				repoPaths.add(task.repoPath);
+				if (task.worktreePath) repoPaths.add(task.worktreePath);
+				task.widgetMode = mode;
+				persistTask(pi, task);
+			}
+			writeWidgetMode(mode, Array.from(repoPaths));
 			const active = activeTaskId ? tasks.get(activeTaskId) : undefined;
 			const latest =
 				active ??
@@ -1585,6 +1804,47 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 				`Trace files for ${taskId}:\n${files.join("\n") || "(none yet)"}\n\nTip: open *.prompt.md to see exact prompts, *.result.md for outputs.`,
 				"info",
 			);
+		},
+	});
+
+	pi.registerCommand("orchestrate-tail", {
+		description: "Show the latest live stream log lines for one task: /orchestrate-tail <task-id>",
+		handler: async (args, ctx) => {
+			const taskId = (args ?? "").trim();
+			const defaultTaskId =
+				activeTaskId ??
+				Array.from(tasks.values())
+					.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+					.at(0)?.id;
+			const resolvedTaskId = taskId || defaultTaskId;
+			if (!resolvedTaskId) {
+				ctx.ui.notify("Usage: /orchestrate-tail <task-id>", "warning");
+				return;
+			}
+			const task = tasks.get(resolvedTaskId) ?? loadTaskById(ctx, resolvedTaskId);
+			if (!task) {
+				ctx.ui.notify(`Task not found: ${resolvedTaskId}`, "warning");
+				return;
+			}
+			const liveLogPath = task.liveLogPath ?? getLiveLogPath(task.repoPath ?? ctx.cwd, task);
+			if (!fs.existsSync(liveLogPath)) {
+				ctx.ui.notify(`No live log yet: ${liveLogPath}`, "info");
+				return;
+			}
+			const allLines = fs
+				.readFileSync(liveLogPath, "utf-8")
+				.split("\n")
+				.map((x) => x.trimEnd())
+				.filter(Boolean);
+			const streamLines = allLines.filter((line) => line.includes("[stream:"));
+			const streamTail = streamLines.slice(-80);
+			const rawTail = allLines.slice(-80);
+			const lines = streamTail.length > 0 ? streamTail : rawTail;
+			ctx.ui.notify(
+				`Live log tail for ${resolvedTaskId} (${liveLogPath})${streamTail.length > 0 ? " [stream lines]" : " [all lines]"}:\n${lines.join("\n")}`,
+				"info",
+			);
+			refreshLiveUi(ctx, task);
 		},
 	});
 
