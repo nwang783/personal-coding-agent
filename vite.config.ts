@@ -29,24 +29,22 @@ type StreamEvent = {
   text: string;
 };
 
-type ReviewFinding = {
-  severity: "P0" | "P1" | "P2" | "P3";
-  title: string;
-  description: string;
-  file?: string;
-  line?: number;
+type DispatchRecord = {
+  at: string;
+  agent: string;
+  provider: "codex" | "amp";
+  taskKind: "spec" | "implementation" | "review" | "validation";
+  promptPreview?: string;
+  resultSummary?: string;
+  timing?: number;
+  timedOut?: boolean;
+  sessionId?: string;
 };
 
-type VerificationItem = {
-  command: string;
-  outcome: "passed" | "failed" | "not_run";
-  details: string;
-};
-
-type CiCheck = {
-  name: string;
-  status: "passed" | "failed" | "pending" | "not_run";
-  details: string;
+type ProgressEntry = {
+  at: string;
+  agent: string;
+  line: string;
 };
 
 type HandoffRecord = {
@@ -70,14 +68,12 @@ type TaskState = {
   stage: TaskStage;
   createdAt: string;
   updatedAt: string;
-  specPath?: string;
-  liveLogPath?: string;
   liveStatePath?: string;
   traceDir?: string;
   reportJsonPath?: string;
   reportMarkdownPath?: string;
-  eventLogPath?: string;
-  routedAgent?: "codex-impl" | "amp-impl";
+  progressPath?: string;
+  promptDraftPath?: string;
   reviewLoops: number;
   validationLoops: number;
   maxReviewLoops: number;
@@ -92,22 +88,22 @@ type TaskState = {
   lastCommitShas?: string[];
   lastPrUrl?: string;
   lastPrFailureReason?: string;
-  codexReviewSessionId?: string;
-  blockingFindings: ReviewFinding[];
-  validationIssues: string[];
-  lastVerification?: VerificationItem[];
-  lastCiChecks?: CiCheck[];
   lastArtifacts?: Record<string, unknown>;
   finalReport?: string;
   history: HistoryEntry[];
   traceSeq?: number;
   activeAgentName?: string;
-  activeAgentPurpose?: string;
   lastPromptPath?: string;
   lastResultPath?: string;
-  lastSubagentCommand?: string;
-  lastStreamEvent?: string;
+  lastDispatchPromptPath?: string;
+  lastDispatchResultPath?: string;
+  dispatchHistory: DispatchRecord[];
+  progressEntries: ProgressEntry[];
+  lastDispatchProvider?: "codex" | "amp";
+  workflowBugReport?: string;
+  liveLogPath?: string;
   streamEvents?: StreamEvent[];
+  stopRequested?: boolean;
 };
 
 type TaskSummary = {
@@ -116,25 +112,27 @@ type TaskSummary = {
   status: TaskStatus;
   stage: TaskStage;
   updatedAt: string;
+  currentAgent?: string;
   activeAgentName?: string;
-  activeAgentPurpose?: string;
-  routedAgent?: "codex-impl" | "amp-impl";
+  lastProgressLine?: string;
   lastNote?: string;
   reviewLoops: number;
   validationLoops: number;
   maxReviewLoops: number;
   maxValidationLoops: number;
+  handoffCount: number;
+  failureKind?: string;
+  stopRequested?: boolean;
 };
 
 type TaskDetailResponse = {
   task: TaskState;
   summaries: {
-    specPreview?: string;
+    progressPreview?: string;
     promptPreview?: string;
     resultPreview?: string;
     reportPreview?: string;
   };
-  liveLogTail: string[];
   traceFiles: Array<{
     name: string;
     path: string;
@@ -143,7 +141,24 @@ type TaskDetailResponse = {
 };
 
 const repoRoot = process.cwd();
-const reportsDir = path.join(repoRoot, ".pi", "reports");
+const projectsRoot = path.dirname(repoRoot);
+
+function getCandidateReportsDirs(): string[] {
+  const dirs = new Set<string>([path.join(repoRoot, ".pi", "reports")]);
+  try {
+    for (const entry of fs.readdirSync(projectsRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      dirs.add(path.join(projectsRoot, entry.name, ".pi", "reports"));
+    }
+  } catch {
+    // ignore
+  }
+  return Array.from(dirs).filter((dir) => fs.existsSync(dir));
+}
+
+function getReportsDirForTask(task: TaskState): string {
+  return path.join(task.repoPath, ".pi", "reports");
+}
 
 function safeReadJson<T>(filePath: string): T | undefined {
   try {
@@ -178,10 +193,12 @@ function parseStreamEvents(liveLogPath: string | undefined): StreamEvent[] {
 }
 
 function loadTask(taskId: string): TaskState | undefined {
-  const candidates = [
-    path.join(reportsDir, `${taskId}.state.json`),
-    path.join(reportsDir, `${taskId}.json`),
-  ].filter((filePath) => fs.existsSync(filePath));
+  const candidates = getCandidateReportsDirs()
+    .flatMap((reportsDir) => [
+      path.join(reportsDir, `${taskId}.state.json`),
+      path.join(reportsDir, `${taskId}.json`),
+    ])
+    .filter((filePath) => fs.existsSync(filePath));
 
   if (candidates.length === 0) return undefined;
   const latest = candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
@@ -194,11 +211,12 @@ function loadTask(taskId: string): TaskState | undefined {
 }
 
 function loadTaskIds(): string[] {
-  if (!fs.existsSync(reportsDir)) return [];
   const ids = new Set<string>();
-  for (const entry of fs.readdirSync(reportsDir)) {
-    const match = entry.match(/^(task-[^.]+)(?:\.state)?\.json$/);
-    if (match) ids.add(match[1]);
+  for (const reportsDir of getCandidateReportsDirs()) {
+    for (const entry of fs.readdirSync(reportsDir)) {
+      const match = entry.match(/^(task-[^.]+)(?:\.state)?\.json$/);
+      if (match) ids.add(match[1]);
+    }
   }
   return Array.from(ids);
 }
@@ -216,8 +234,7 @@ function listTasks(): TaskSummary[] {
       updatedAt: task.updatedAt,
       currentAgent: task.currentAgent,
       activeAgentName: task.activeAgentName,
-      activeAgentPurpose: task.activeAgentPurpose,
-      routedAgent: task.routedAgent,
+      lastProgressLine: (task.progressEntries ?? []).at(-1)?.line,
       lastNote: task.history.at(-1)?.note,
       reviewLoops: task.reviewLoops,
       validationLoops: task.validationLoops,
@@ -225,6 +242,7 @@ function listTasks(): TaskSummary[] {
       maxValidationLoops: task.maxValidationLoops,
       handoffCount: task.handoffCount,
       failureKind: task.failureKind,
+      stopRequested: task.stopRequested,
     }));
 }
 
@@ -243,6 +261,23 @@ function listTraceFiles(traceDir: string | undefined): TaskDetailResponse["trace
   }));
 }
 
+function getStopRequestPath(task: TaskState): string {
+  return path.join(getReportsDirForTask(task), `${task.id}.stop`);
+}
+
+function requestTaskStop(task: TaskState): { ok: boolean; error?: string } {
+  try {
+    fs.writeFileSync(getStopRequestPath(task), `Stop requested at ${new Date().toISOString()}\n`, "utf-8");
+    if (task.liveStatePath && fs.existsSync(task.liveStatePath)) {
+      const nextTask = { ...task, stopRequested: true };
+      fs.writeFileSync(task.liveStatePath, JSON.stringify(nextTask, null, 2), "utf-8");
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 function buildTaskDetail(taskId: string): TaskDetailResponse | undefined {
   const task = loadTask(taskId);
   if (!task) return undefined;
@@ -250,15 +285,11 @@ function buildTaskDetail(taskId: string): TaskDetailResponse | undefined {
   return {
     task,
     summaries: {
-      specPreview: readPreview(task.specPath),
+      progressPreview: readPreview(task.progressPath, 20),
       promptPreview: readPreview(task.lastPromptPath),
       resultPreview: readPreview(task.lastResultPath),
-      reportPreview: readPreview(task.reportMarkdownPath ?? path.join(reportsDir, `${task.id}.md`), 24),
+      reportPreview: readPreview(task.reportMarkdownPath ?? path.join(getReportsDirForTask(task), `${task.id}.md`), 24),
     },
-    liveLogTail:
-      task.liveLogPath && fs.existsSync(task.liveLogPath)
-        ? fs.readFileSync(task.liveLogPath, "utf-8").split("\n").filter(Boolean).slice(-80)
-        : [],
     traceFiles: listTraceFiles(task.traceDir),
   };
 }
@@ -276,12 +307,14 @@ function sendJson(
 function attachApi(server: ViteDevServer | PreviewServer): void {
   server.middlewares.use("/api/tasks", (req, res) => {
     const url = req.url ?? "/";
-    if (url === "/" || url === "") {
+    if ((url === "/" || url === "") && req.method === "GET") {
       sendJson(res, { tasks: listTasks() });
       return;
     }
 
-    const taskId = decodeURIComponent(url.replace(/^\/+/, "").split("?")[0] ?? "");
+    const pathname = url.replace(/^\/+/, "").split("?")[0] ?? "";
+    const isStopRequest = pathname.endsWith("/stop");
+    const taskId = decodeURIComponent(isStopRequest ? pathname.slice(0, -"/stop".length) : pathname);
     if (!taskId) {
       sendJson(res, { error: "Task id required" }, 400);
       return;
@@ -290,6 +323,15 @@ function attachApi(server: ViteDevServer | PreviewServer): void {
     const detail = buildTaskDetail(taskId);
     if (!detail) {
       sendJson(res, { error: `Task not found: ${taskId}` }, 404);
+      return;
+    }
+    if (req.method === "POST" && isStopRequest) {
+      const stop = requestTaskStop(detail.task);
+      sendJson(res, stop.ok ? { ok: true } : { error: stop.error ?? "Unable to stop task" }, stop.ok ? 200 : 500);
+      return;
+    }
+    if (req.method !== "GET") {
+      sendJson(res, { error: "Method not allowed" }, 405);
       return;
     }
     sendJson(res, detail);

@@ -786,6 +786,40 @@ pre {
   flex-shrink: 0;
 }
 
+/* ── Pipeline: progress log ─────────────────────────────── */
+
+.pipeline-progress-log {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pipeline-progress-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+
+.pipeline-progress-line {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pipeline-progress-entry time {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
 /* ── Pipeline: failure banner ───────────────────────────── */
 
 .pipeline-failure-banner {

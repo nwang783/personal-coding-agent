@@ -25,24 +25,22 @@ export type StreamEvent = {
   text: string;
 };
 
-export type ReviewFinding = {
-  severity: string;
-  title: string;
-  description: string;
-  file?: string;
-  line?: number;
+export type DispatchRecord = {
+  at: string;
+  agent: string;
+  provider: "codex" | "amp";
+  taskKind: "spec" | "implementation" | "review" | "validation";
+  promptPreview?: string;
+  resultSummary?: string;
+  timing?: number;
+  timedOut?: boolean;
+  sessionId?: string;
 };
 
-export type VerificationItem = {
-  command: string;
-  outcome: "passed" | "failed" | "not_run";
-  details: string;
-};
-
-export type CiCheck = {
-  name: string;
-  status: "passed" | "failed" | "pending" | "not_run";
-  details: string;
+export type ProgressEntry = {
+  at: string;
+  agent: string;
+  line: string;
 };
 
 export type HandoffRecord = {
@@ -63,8 +61,7 @@ export type TaskSummary = {
   updatedAt: string;
   currentAgent?: string;
   activeAgentName?: string;
-  activeAgentPurpose?: string;
-  routedAgent?: "codex-impl" | "amp-impl";
+  lastProgressLine?: string;
   lastNote?: string;
   reviewLoops: number;
   validationLoops: number;
@@ -72,6 +69,7 @@ export type TaskSummary = {
   maxValidationLoops: number;
   handoffCount: number;
   failureKind?: string;
+  stopRequested?: boolean;
 };
 
 export type TaskDetail = {
@@ -86,13 +84,11 @@ export type TaskDetail = {
     stage: TaskStage;
     createdAt: string;
     updatedAt: string;
-    specPath?: string;
-    liveLogPath?: string;
     traceDir?: string;
     reportJsonPath?: string;
     reportMarkdownPath?: string;
-    eventLogPath?: string;
-    routedAgent?: "codex-impl" | "amp-impl";
+    progressPath?: string;
+    promptDraftPath?: string;
     reviewLoops: number;
     validationLoops: number;
     maxReviewLoops: number;
@@ -107,29 +103,28 @@ export type TaskDetail = {
     lastCommitShas?: string[];
     lastPrUrl?: string;
     lastPrFailureReason?: string;
-    codexReviewSessionId?: string;
-    blockingFindings: ReviewFinding[];
-    validationIssues: string[];
-    lastVerification?: VerificationItem[];
-    lastCiChecks?: CiCheck[];
     lastArtifacts?: Record<string, unknown>;
     finalReport?: string;
     history: HistoryEntry[];
     activeAgentName?: string;
-    activeAgentPurpose?: string;
     lastPromptPath?: string;
     lastResultPath?: string;
-    lastSubagentCommand?: string;
-    lastStreamEvent?: string;
+    lastDispatchPromptPath?: string;
+    lastDispatchResultPath?: string;
+    dispatchHistory: DispatchRecord[];
+    progressEntries: ProgressEntry[];
+    lastDispatchProvider?: "codex" | "amp";
+    workflowBugReport?: string;
+    liveLogPath?: string;
     streamEvents?: StreamEvent[];
+    stopRequested?: boolean;
   };
   summaries: {
-    specPreview?: string;
+    progressPreview?: string;
     promptPreview?: string;
     resultPreview?: string;
     reportPreview?: string;
   };
-  liveLogTail: string[];
   traceFiles: Array<{
     name: string;
     path: string;

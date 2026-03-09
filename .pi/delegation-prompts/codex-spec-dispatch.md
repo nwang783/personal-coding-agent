@@ -15,6 +15,10 @@ Your job:
    - Implementation Notes
 
 Hard requirements:
+- The payload will include both a repository root path and an active worktree path.
+- Treat the worktree path as the only writable checkout for this task.
+- Do all repository inspection and any file output relative to the provided worktree path.
+- Do not inspect or modify sibling repos or any other path on disk.
 - Keep acceptance criteria testable.
 - Include at least one risk/constraint item.
 - Make the spec implementation-focused with explicit phased execution and completion checks.

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
@@ -16,7 +17,9 @@ type FailureKind =
 	| "invalid_transition"
 	| "protocol_violation"
 	| "max_loops_exceeded"
-	| "tool_error";
+	| "tool_error"
+	| "workflow_bug_reported"
+	| "stopped";
 type WidgetMode = "compact" | "handoff" | "prompt" | "result" | "history" | "stream";
 
 type ReviewFinding = {
@@ -65,6 +68,12 @@ type FinishPayload = {
 	summary: string;
 	report: string;
 	artifacts?: ArtifactBag;
+};
+
+type WorkflowBugPayload = {
+	summary: string;
+	details: string;
+	terminate: boolean;
 };
 
 type HandoffRecord = {
@@ -149,6 +158,8 @@ type TaskState = {
 	reportJsonPath?: string;
 	reportMarkdownPath?: string;
 	eventLogPath?: string;
+	progressPath?: string;
+	promptDraftPath?: string;
 	reviewLoops: number;
 	validationLoops: number;
 	maxReviewLoops: number;
@@ -177,6 +188,8 @@ type TaskState = {
 	activeAgentPurpose?: string;
 	lastPromptPath?: string;
 	lastResultPath?: string;
+	lastDispatchPromptPath?: string;
+	lastDispatchResultPath?: string;
 	lastSubagentCommand?: string;
 	lastStreamEvent?: string;
 	streamEvents?: Array<{ at: string; agent: string; purpose: string; kind: string; text: string }>;
@@ -194,7 +207,8 @@ type AgentConfig = {
 
 type ToolSignal =
 	| { kind: "handoff"; payload: HandoffPayload }
-	| { kind: "finish"; payload: FinishPayload };
+	| { kind: "finish"; payload: FinishPayload }
+	| { kind: "workflow_bug"; payload: WorkflowBugPayload };
 
 type SubagentRun = {
 	ok: boolean;
@@ -207,6 +221,7 @@ type SubagentRun = {
 	deltaCount: number;
 	durationMs: number;
 	timedOut: boolean;
+	stopRequested: boolean;
 	toolSignals: ToolSignal[];
 };
 
@@ -236,16 +251,32 @@ function isGitRepoRoot(candidate: string): boolean {
 	}
 }
 
-function deriveRepoPathFromTask(taskInput: string, fallbackCwd: string): string {
-	const candidates = new Set<string>();
-	const raw = taskInput.trim();
-	for (const match of raw.matchAll(/\((~?\/[^)]+)\)/g)) candidates.add(match[1]);
-	for (const match of raw.matchAll(/\b(~\/[^\s"')]+|\/[^\s"')]+)\b/g)) candidates.add(match[1]);
-	for (const candidate of candidates) {
-		const resolved = path.resolve(expandHome(candidate));
-		if (isGitRepoRoot(resolved)) return resolved;
+function resolveRepoPath(repoInput: string, cwd: string): string | undefined {
+	if (!repoInput.trim()) return undefined;
+	const expanded = expandHome(repoInput.trim());
+	const resolved = path.resolve(cwd, expanded);
+	return isGitRepoRoot(resolved) ? resolved : undefined;
+}
+
+function parseOrchestrateArgs(
+	args: string,
+	cwd: string,
+): { repoPath?: string; taskInput?: string; error?: string } {
+	const raw = args.trim();
+	const divider = raw.indexOf(" -- ");
+	if (divider === -1) {
+		return { error: "Usage: /orchestrate <repo-path> -- <task description>" };
 	}
-	return fallbackCwd;
+	const repoInput = raw.slice(0, divider).trim();
+	const taskInput = raw.slice(divider + 4).trim();
+	if (!repoInput || !taskInput) {
+		return { error: "Usage: /orchestrate <repo-path> -- <task description>" };
+	}
+	const repoPath = resolveRepoPath(repoInput, cwd);
+	if (!repoPath) {
+		return { error: `Repository path must point to a git repo root: ${repoInput}` };
+	}
+	return { repoPath, taskInput };
 }
 
 function getSubagentTimeoutMs(): number {
@@ -253,6 +284,12 @@ function getSubagentTimeoutMs(): number {
 	const parsed = raw ? Number(raw) : NaN;
 	if (Number.isFinite(parsed) && parsed > 0) return parsed;
 	return 15 * 60 * 1000;
+}
+
+function getSubagentRuntimeCwd(): string {
+	const dir = path.join(os.tmpdir(), "pi-orchestrator-runtime");
+	ensureDir(dir);
+	return dir;
 }
 
 function safeFilename(input: string): string {
@@ -377,6 +414,14 @@ function parseFinishPayload(args: Record<string, unknown>): FinishPayload {
 	};
 }
 
+function parseWorkflowBugPayload(args: Record<string, unknown>): WorkflowBugPayload {
+	return {
+		summary: String(args.summary ?? ""),
+		details: String(args.details ?? ""),
+		terminate: Boolean(args.terminate),
+	};
+}
+
 function previewFile(filePath: string | undefined, maxLines: number, maxCharsPerLine = 140): string[] {
 	if (!filePath || !fs.existsSync(filePath)) return [];
 	try {
@@ -446,6 +491,68 @@ function getEventLogPath(cwd: string, state: TaskState): string {
 	ensureDir(reportDir);
 	state.eventLogPath = path.join(reportDir, `${safeFilename(state.id)}.events.jsonl`);
 	return state.eventLogPath;
+}
+
+function getProgressPath(cwd: string, state: TaskState): string {
+	if (state.progressPath) return state.progressPath;
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	state.progressPath = path.join(reportDir, `${safeFilename(state.id)}.progress.md`);
+	if (!fs.existsSync(state.progressPath)) {
+		fs.writeFileSync(state.progressPath, "# Progress\n\n", "utf-8");
+	}
+	return state.progressPath;
+}
+
+function readProgress(state: TaskState): string {
+	const progressPath = getProgressPath(state.repoPath, state);
+	return fs.existsSync(progressPath) ? fs.readFileSync(progressPath, "utf-8") : "# Progress\n\n";
+}
+
+function appendProgressEntry(state: TaskState, agent: RuntimeAgent, entry: string): void {
+	const trimmed = entry.trim().replace(/\s+/g, " ");
+	if (!trimmed) return;
+	const progressPath = getProgressPath(state.repoPath, state);
+	const line = `- ${agent}: ${trimmed.slice(0, 240)}\n`;
+	fs.appendFileSync(progressPath, line, "utf-8");
+}
+
+function getPromptDraftPath(cwd: string, state: TaskState): string {
+	if (state.promptDraftPath) return state.promptDraftPath;
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	state.promptDraftPath = path.join(reportDir, `${safeFilename(state.id)}.prompt-draft.md`);
+	return state.promptDraftPath;
+}
+
+function writePromptDraft(state: TaskState, content: string): string {
+	const promptPath = getPromptDraftPath(state.repoPath, state);
+	fs.writeFileSync(promptPath, content, "utf-8");
+	return promptPath;
+}
+
+function readPromptDraft(state: TaskState): string {
+	const promptPath = getPromptDraftPath(state.repoPath, state);
+	return fs.existsSync(promptPath) ? fs.readFileSync(promptPath, "utf-8") : "";
+}
+
+function getStopRequestPath(cwd: string, state: TaskState): string {
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	return path.join(reportDir, `${safeFilename(state.id)}.stop`);
+}
+
+function hasStopRequest(cwd: string, state: TaskState): boolean {
+	return fs.existsSync(getStopRequestPath(cwd, state));
+}
+
+function writeStopRequest(cwd: string, state: TaskState, reason: string): void {
+	fs.writeFileSync(getStopRequestPath(cwd, state), `${reason}\n`, "utf-8");
+}
+
+function clearStopRequest(cwd: string, state: TaskState): void {
+	const stopPath = getStopRequestPath(cwd, state);
+	if (fs.existsSync(stopPath)) fs.unlinkSync(stopPath);
 }
 
 function appendHistory(state: TaskState, stage: TaskStage, note: string): void {
@@ -613,6 +720,11 @@ function validateToolSignal(fromAgent: RuntimeAgent, signal: ToolSignal): string
 		if (!summary.trim()) return "Handoff summary is required";
 		return undefined;
 	}
+	if (signal.kind === "workflow_bug") {
+		if (!signal.payload.summary.trim()) return "Workflow bug summary is required";
+		if (!signal.payload.details.trim()) return "Workflow bug details are required";
+		return undefined;
+	}
 	const { outcome, summary, report } = signal.payload;
 	if (fromAgent !== "reviewer" && fromAgent !== "validator" && fromAgent !== "reporter") {
 		return `Agent ${fromAgent} cannot finish the workflow`;
@@ -711,6 +823,7 @@ function buildReportMarkdown(state: TaskState): string {
 		`- Repository Root: ${state.repoPath}`,
 		`- Worktree Path: ${state.worktreePath ?? "n/a"}`,
 		`- Worktree Branch: ${state.worktreeBranch ?? "n/a"}`,
+		`- Progress File: ${state.progressPath ?? "n/a"}`,
 		`- Current Agent: ${state.currentAgent ?? "n/a"}`,
 		`- Branch: ${state.lastBranchName ?? "n/a"}`,
 		`- Pull Request: ${state.lastPrUrl ?? "n/a"}`,
@@ -731,6 +844,9 @@ function buildReportMarkdown(state: TaskState): string {
 		"## Validation Issues",
 		...(state.validationIssues.length > 0 ? state.validationIssues.map((issue) => `- ${issue}`) : ["- None"]),
 		"",
+		"## Progress",
+		readProgress(state),
+		"",
 		"## Final Report",
 		state.finalReport?.trim() || "No final report captured.",
 		"",
@@ -748,13 +864,143 @@ function saveFinalArtifacts(state: TaskState): void {
 	state.reportMarkdownPath = mdPath;
 }
 
+type DispatchCodingResult = {
+	ok: boolean;
+	provider: "codex" | "amp";
+	taskKind: "spec" | "implementation" | "review" | "validation";
+	exitCode: number;
+	timedOut: boolean;
+	durationMs: number;
+	finalAssistantText: string;
+	fullAssistantText: string;
+	stderr: string;
+	sessionId?: string;
+	promptPath: string;
+	resultPath: string;
+};
+
+async function dispatchCodingRun(
+	state: TaskState,
+	agentName: RuntimeAgent,
+	provider: "codex" | "amp",
+	taskKind: "spec" | "implementation" | "review" | "validation",
+	resumeSessionId?: string,
+): Promise<DispatchCodingResult> {
+	const promptBody = readPromptDraft(state).trim();
+	if (!promptBody) {
+		throw new Error("No prompt draft available. Call write_prompt before dispatch_coding_agent.");
+	}
+	const traceDir = getTraceDir(state.repoPath, state);
+	const stem = `${Date.now()}-${safeFilename(agentName)}-${provider}-${taskKind}-dispatch`;
+	const promptPath = path.join(traceDir, `${stem}.delegated.prompt.md`);
+	const resultPath = path.join(traceDir, `${stem}.delegated.result.md`);
+	const progress = readProgress(state);
+	const fullPrompt = [
+		`Repository root path: ${state.repoPath}`,
+		`Active worktree path: ${state.worktreePath ?? state.repoPath}`,
+		`Active git branch: ${state.worktreeBranch ?? "(unknown)"}`,
+		"All edits and git actions must happen only in the active worktree path.",
+		"Do not inspect or modify sibling repos or any other checkout on disk.",
+		"",
+		"Current run progress:",
+		progress.trim(),
+		"",
+		"Task payload:",
+		promptBody,
+		"",
+	].join("\n");
+	fs.writeFileSync(promptPath, fullPrompt, "utf-8");
+	state.lastDispatchPromptPath = promptPath;
+	const started = Date.now();
+	const timeoutMs = getSubagentTimeoutMs();
+	const execArgs =
+		provider === "codex"
+			? resumeSessionId
+				? ["exec", "resume", resumeSessionId, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", "-",]
+				: ["exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", "-"]
+			: ["--dangerously-allow-all", "-x", "--stream-json"];
+	const command = provider === "codex" ? "codex" : "amp";
+	const result = await new Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }>((resolve) => {
+		const stdin = fs.readFileSync(promptPath, "utf-8");
+		const child = spawn(command, execArgs, {
+			cwd: state.worktreePath ?? state.repoPath,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+			setTimeout(() => child.kill("SIGKILL"), 5_000);
+		}, timeoutMs);
+		child.stdin.write(stdin);
+		child.stdin.end();
+		child.stdout.on("data", (chunk) => {
+			stdout += chunk.toString("utf-8");
+		});
+		child.stderr.on("data", (chunk) => {
+			stderr += chunk.toString("utf-8");
+		});
+		child.on("close", (code) => {
+			clearTimeout(timeout);
+			resolve({ code: code ?? 1, stdout, stderr, timedOut });
+		});
+		child.on("error", (error) => {
+			clearTimeout(timeout);
+			resolve({ code: 1, stdout, stderr: `${stderr}\n${error.message}`.trim(), timedOut });
+		});
+	});
+	const output = result.stdout.trim();
+	fs.writeFileSync(resultPath, output || result.stderr || "(empty)", "utf-8");
+	state.lastDispatchResultPath = resultPath;
+	let finalAssistantText = output;
+	let sessionId: string | undefined;
+	if (provider === "codex") {
+		const chunks = output.split("\n").filter(Boolean);
+		const messages: string[] = [];
+		for (const line of chunks) {
+			try {
+				const event = JSON.parse(line) as Record<string, unknown>;
+				if (event.type === "thread.started") sessionId = String(event.thread_id ?? "");
+				if (event.type === "message_end") {
+					const msg = event.message as Record<string, unknown> | undefined;
+					const content = msg?.content as Array<Record<string, unknown>> | undefined;
+					if (content) {
+						const text = content.filter((item) => item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
+						if (text) messages.push(text);
+					}
+				}
+			} catch {
+				// ignore
+			}
+		}
+		if (messages.length > 0) finalAssistantText = messages[messages.length - 1];
+	}
+	return {
+		ok: result.code === 0 && !result.timedOut,
+		provider,
+		taskKind,
+		exitCode: result.code,
+		timedOut: result.timedOut,
+		durationMs: Date.now() - started,
+		finalAssistantText: finalAssistantText || "(empty)",
+		fullAssistantText: output || "(empty)",
+		stderr: result.stderr.trim(),
+		sessionId,
+		promptPath,
+		resultPath,
+	};
+}
+
 async function runSubagent(
 	agent: AgentConfig,
 	taskPrompt: string,
-	runCwd: string,
+	taskId: string,
 	repoRootPath: string,
 	worktreePath: string,
 	worktreeBranch: string | undefined,
+	stopRequestPath: string,
 	onStreamEvent?: (kind: string, text: string) => void,
 ): Promise<SubagentRun> {
 	const args = ["--mode", "json", "-p", "--no-session"];
@@ -777,6 +1023,8 @@ async function runSubagent(
 				"- Always work in the active worktree path above.",
 				"- Do not clone the repository again.",
 				"- Do not create nested duplicate repos.",
+				"- Use progress.md as compact shared memory for the run.",
+				"- Keep progress.md entries minimal; handoff carries the detailed transfer context.",
 				"- End your run by calling either handoff or finish exactly once.",
 				"- handoff and finish are PI TOOLS, not shell commands.",
 				"- Never use bash, which, ls, find, or grep to look for handoff or finish.",
@@ -797,6 +1045,7 @@ async function runSubagent(
 		let deltaCount = 0;
 		let pendingDelta = "";
 		let stdoutBuffer = "";
+		let stopRequested = false;
 		const flushDelta = (): void => {
 			const text = pendingDelta.trim();
 			if (!text) return;
@@ -846,6 +1095,9 @@ async function runSubagent(
 						if (toolName === "finish") {
 							toolSignals.push({ kind: "finish", payload: parseFinishPayload(pending.args) });
 						}
+						if (toolName === "report_bug_in_workflow") {
+							toolSignals.push({ kind: "workflow_bug", payload: parseWorkflowBugPayload(pending.args) });
+						}
 					}
 					pendingToolArgs.delete(toolCallId);
 					return;
@@ -876,12 +1128,29 @@ async function runSubagent(
 		const started = Date.now();
 		const result = await new Promise<{ code: number; stderr: string }>((resolve) => {
 			const timeoutMs = getSubagentTimeoutMs();
-			const child = spawn("pi", args, { cwd: runCwd, stdio: ["ignore", "pipe", "pipe"] });
+			const child = spawn("pi", args, {
+				cwd: getSubagentRuntimeCwd(),
+				stdio: ["ignore", "pipe", "pipe"],
+				env: {
+					...process.env,
+					PI_ORCHESTRATOR_TASK_ID: taskId,
+					PI_ORCHESTRATOR_ACTIVE_AGENT: agent.name,
+					PI_ORCHESTRATOR_REPO_PATH: repoRootPath,
+					PI_ORCHESTRATOR_WORKTREE_PATH: worktreePath,
+				},
+			});
 			let done = false;
 			const complete = (code: number, err: string): void => {
 				if (done) return;
 				done = true;
 				resolve({ code, stderr: err });
+			};
+			const maybeStop = (): void => {
+				if (stopRequested || !fs.existsSync(stopRequestPath)) return;
+				stopRequested = true;
+				onStreamEvent?.("stop_requested", "stop request received; terminating subagent");
+				child.kill("SIGTERM");
+				setTimeout(() => child.kill("SIGKILL"), 5_000);
 			};
 			const timeout = setTimeout(() => {
 				timedOut = true;
@@ -889,7 +1158,9 @@ async function runSubagent(
 				child.kill("SIGTERM");
 				setTimeout(() => child.kill("SIGKILL"), 5_000);
 			}, timeoutMs);
+			const stopPoll = setInterval(maybeStop, 1000);
 			child.stdout.on("data", (chunk) => {
+				maybeStop();
 				stdoutBuffer += chunk.toString("utf-8");
 				let idx = stdoutBuffer.indexOf("\n");
 				while (idx !== -1) {
@@ -900,14 +1171,17 @@ async function runSubagent(
 				}
 			});
 			child.stderr.on("data", (chunk) => {
+				maybeStop();
 				stderr += chunk.toString("utf-8");
 			});
 			child.on("error", (error) => {
 				clearTimeout(timeout);
+				clearInterval(stopPoll);
 				complete(1, `${stderr}\n${error.message}`.trim());
 			});
 			child.on("close", (code) => {
 				clearTimeout(timeout);
+				clearInterval(stopPoll);
 				if (stdoutBuffer.trim()) parseLine(stdoutBuffer.trim());
 				flushDelta();
 				complete(code ?? 1, stderr.trim());
@@ -924,6 +1198,7 @@ async function runSubagent(
 			deltaCount,
 			durationMs: Date.now() - started,
 			timedOut,
+			stopRequested,
 			toolSignals,
 		};
 	} finally {
@@ -955,12 +1230,17 @@ async function runWorkflow(
 	};
 	const runAgent = async (agentName: RuntimeAgent, purpose: string, prompt: string): Promise<SubagentRun> => {
 		const executionPath = state.worktreePath ?? state.repoPath;
+		const progressText = readProgress(state);
 		const contextualPrompt = [
 			`Execution repository path: ${executionPath}`,
 			`Repository root path: ${state.repoPath}`,
 			`Execution git branch: ${state.worktreeBranch ?? "(unknown)"}`,
+			`Progress file path: ${getProgressPath(state.repoPath, state)}`,
 			`Current agent: ${agentName}`,
 			`Current stage: ${getStageForAgent(agentName)}`,
+			"",
+			"Current run progress:",
+			progressText.trim(),
 			"",
 			prompt,
 		].join("\n");
@@ -992,10 +1272,11 @@ async function runWorkflow(
 		const run = await runSubagent(
 			selectedAgent,
 			contextualPrompt,
-			executionPath,
+			state.id,
 			state.repoPath,
 			executionPath,
 			state.worktreeBranch,
+			getStopRequestPath(state.repoPath, state),
 			(kind, text) => {
 				const at = nowIso();
 				const normalizedText = text.replace(/\s+/g, " ").trim().slice(0, 260);
@@ -1025,6 +1306,7 @@ async function runWorkflow(
 			`- Event Count: ${run.eventCount}`,
 			`- Delta Count: ${run.deltaCount}`,
 			`- Tool Event Count: ${run.toolEventCount}`,
+			`- Stop Requested: ${run.stopRequested}`,
 			`- Tool Signals: ${run.toolSignals.length}`,
 			"",
 			"## Final Assistant Text",
@@ -1057,6 +1339,7 @@ async function runWorkflow(
 					eventCount: run.eventCount,
 					deltaCount: run.deltaCount,
 					toolEventCount: run.toolEventCount,
+					stopRequested: run.stopRequested,
 					toolSignals: run.toolSignals,
 					command: state.lastSubagentCommand,
 				},
@@ -1086,6 +1369,7 @@ async function runWorkflow(
 	persistTask(pi, state);
 	refreshLiveUi(ctx, state);
 	await ensureTaskWorktree(pi, state);
+	clearStopRequest(state.repoPath, state);
 	recordProgress(pi, ctx, state, "received", `Worktree ready at ${state.worktreePath} on branch ${state.worktreeBranch}`);
 	recordEvent(state, {
 		type: state.handoffCount > 0 ? "task_resumed" : "task_started",
@@ -1108,6 +1392,9 @@ async function runWorkflow(
 		].join("\n");
 	let purpose = "agent-runtime";
 	while (true) {
+		if (hasStopRequest(state.repoPath, state)) {
+			return failTask("stopped", "Stop requested by user", currentAgent);
+		}
 		if (currentAgent === "reviewer") {
 			if (state.reviewLoops >= state.maxReviewLoops) return failTask("max_loops_exceeded", "Exceeded max review loops", currentAgent);
 			state.reviewLoops += 1;
@@ -1117,6 +1404,9 @@ async function runWorkflow(
 			state.validationLoops += 1;
 		}
 		const run = await runAgent(currentAgent, purpose, currentMessage);
+		if (run.stopRequested) {
+			return failTask("stopped", "Stop requested by user", currentAgent);
+		}
 		if (!run.ok) {
 			return failTask(run.timedOut ? "timeout" : "subprocess_error", run.stderr || `Agent ${currentAgent} failed`, currentAgent);
 		}
@@ -1166,6 +1456,14 @@ async function runWorkflow(
 			currentAgent = payload.toAgent;
 			purpose = `${record.fromAgent}-handoff`;
 			continue;
+		}
+		if (terminalSignal.kind === "workflow_bug") {
+			const payload = terminalSignal.payload;
+			recordProgress(pi, ctx, state, getStageForAgent(currentAgent), `workflow bug: ${payload.summary}`);
+			if (payload.terminate) {
+				return failTask("workflow_bug_reported", `${payload.summary}\n${payload.details}`, currentAgent);
+			}
+			return failTask("protocol_violation", `Non-terminal workflow bug report left run without next action: ${payload.summary}`, currentAgent);
 		}
 		const payload = terminalSignal.payload;
 		applyArtifactsToState(state, payload.artifacts);
@@ -1229,8 +1527,7 @@ function loadTaskById(ctx: ExtensionContext, taskId: string): TaskState | undefi
 	return loadPersistedTasks(ctx).get(taskId);
 }
 
-function newTaskState(taskInput: string, cwd: string): TaskState {
-	const repoPath = deriveRepoPathFromTask(taskInput, cwd);
+function newTaskState(taskInput: string, repoPath: string): TaskState {
 	const id = `task-${Date.now()}-${randomUUID().slice(0, 8)}`;
 	return {
 		id,
@@ -1254,18 +1551,131 @@ function newTaskState(taskInput: string, cwd: string): TaskState {
 	};
 }
 
+function loadToolTaskState(): TaskState {
+	const repoPath = process.env.PI_ORCHESTRATOR_REPO_PATH;
+	const taskId = process.env.PI_ORCHESTRATOR_TASK_ID;
+	if (!repoPath || !taskId) {
+		throw new Error("Missing orchestrator task context");
+	}
+	const statePath = path.join(repoPath, ".pi", "reports", `${safeFilename(taskId)}.state.json`);
+	const raw = fs.readFileSync(statePath, "utf-8");
+	return JSON.parse(raw) as TaskState;
+}
+
+function persistToolTaskState(state: TaskState): void {
+	writeJsonAtomic(getLiveStatePath(state.repoPath, state), state);
+}
+
 export default function piOrchestratorExtension(pi: ExtensionAPI): void {
-	pi.on("tool_call", async (event) => {
-		if (event.toolName !== "bash") return undefined;
-		const command = String((event.input as { command?: unknown }).command ?? "");
-		if (!command) return undefined;
-		if (/\b(which\s+handoff|which\s+finish|pi\s+.*\bhandoff\b|pi\s+.*\bfinish\b)\b/i.test(command)) {
+	pi.registerTool({
+		name: "write_prompt",
+		label: "write_prompt",
+		description: "Write the full prompt that will be used for the delegated coding agent run.",
+		promptSnippet: "Call write_prompt(prompt) before dispatch_coding_agent.",
+		promptGuidelines: [
+			"Use write_prompt to prepare the full delegated task prompt.",
+			"Include the task-specific instructions only; the runtime will inject repo/worktree/progress context.",
+		],
+		parameters: Type.Object({
+			prompt: Type.String({ description: "Full prompt body for the delegated coding run." }),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const { prompt } = params as { prompt: string };
+			const state = loadToolTaskState();
+			const promptPath = writePromptDraft(state, prompt);
+			persistToolTaskState(state);
 			return {
-				block: true,
-				reason: "Do not use bash or nested pi commands for handoff/finish. Call the Pi tool directly.",
+				content: [{ type: "text", text: `Prompt saved to ${promptPath}` }],
+				details: { action: "write_prompt", promptPath },
 			};
-		}
-		return undefined;
+		},
+	});
+	pi.registerTool({
+		name: "dispatch_coding_agent",
+		label: "dispatch_coding_agent",
+		description: "Dispatch Codex or Amp against the active worktree using the current prompt draft.",
+		promptSnippet: "Call dispatch_coding_agent(provider, task_kind, resume_session_id?) to run Codex/Amp in the active worktree.",
+		promptGuidelines: [
+			"dispatch_coding_agent is the only way to run delegated coding or review work.",
+			"Do not use bash or file tools for implementation, review, or validation work.",
+		],
+		parameters: Type.Object({
+			provider: Type.Union([Type.Literal("codex"), Type.Literal("amp")]),
+			task_kind: Type.Union([
+				Type.Literal("spec"),
+				Type.Literal("implementation"),
+				Type.Literal("review"),
+				Type.Literal("validation"),
+			]),
+			resume_session_id: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const activeAgent = process.env.PI_ORCHESTRATOR_ACTIVE_AGENT as RuntimeAgent | undefined;
+			if (!activeAgent) throw new Error("dispatch_coding_agent is only available inside an orchestrator stage");
+			const { provider, task_kind, resume_session_id } = params as {
+				provider: "codex" | "amp";
+				task_kind: "spec" | "implementation" | "review" | "validation";
+				resume_session_id?: string;
+			};
+			const state = loadToolTaskState();
+			const result = await dispatchCodingRun(state, activeAgent, provider, task_kind, resume_session_id);
+			if (result.sessionId && task_kind === "review") {
+				state.codexReviewSessionId = result.sessionId;
+			}
+			persistToolTaskState(state);
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`Delegated ${provider} ${task_kind} run ${result.ok ? "succeeded" : "failed"}.`,
+							`Duration: ${result.durationMs}ms`,
+							`Prompt: ${result.promptPath}`,
+							`Result: ${result.resultPath}`,
+							`Session: ${result.sessionId ?? "n/a"}`,
+							"",
+							"Final assistant text:",
+							result.finalAssistantText,
+						].join("\n"),
+					},
+				],
+				details: {
+					action: "dispatch_coding_agent",
+					ok: result.ok,
+					provider,
+					taskKind: task_kind,
+					durationMs: result.durationMs,
+					promptPath: result.promptPath,
+					resultPath: result.resultPath,
+					sessionId: result.sessionId,
+				},
+			};
+		},
+	});
+	pi.registerTool({
+		name: "append_progress",
+		label: "append_progress",
+		description: "Append one short factual line to the shared progress.md ledger.",
+		promptSnippet: "Call append_progress(entry) with one short line before handoff/finish.",
+		promptGuidelines: [
+			"Keep progress entries minimal.",
+			"Do not duplicate the full handoff contents in progress.md.",
+		],
+		parameters: Type.Object({
+			entry: Type.String({ description: "Short factual progress update." }),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const activeAgent = process.env.PI_ORCHESTRATOR_ACTIVE_AGENT as RuntimeAgent | undefined;
+			if (!activeAgent) throw new Error("append_progress is only available inside an orchestrator stage");
+			const { entry } = params as { entry: string };
+			const state = loadToolTaskState();
+			appendProgressEntry(state, activeAgent, entry);
+			persistToolTaskState(state);
+			return {
+				content: [{ type: "text", text: `Progress updated in ${getProgressPath(state.repoPath, state)}` }],
+				details: { action: "append_progress" },
+			};
+		},
 	});
 	pi.registerTool({
 		name: "handoff",
@@ -1325,14 +1735,37 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 			};
 		},
 	});
+	pi.registerTool({
+		name: "report_bug_in_workflow",
+		label: "report_bug_in_workflow",
+		description: "Report an orchestration/runtime bug rather than a bug in the target repository.",
+		promptSnippet: "Call report_bug_in_workflow(summary, details, terminate?) when the workflow itself is broken.",
+		promptGuidelines: [
+			"Only use this for workflow/runtime issues, not repository bugs.",
+			"Set terminate=true if the run cannot continue safely.",
+		],
+		parameters: Type.Object({
+			summary: Type.String({ description: "Short workflow bug summary." }),
+			details: Type.String({ description: "Detailed explanation of the workflow/runtime problem." }),
+			terminate: Type.Optional(Type.Boolean()),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const { summary, terminate } = params as { summary: string; terminate?: boolean };
+			return {
+				content: [{ type: "text", text: `Workflow bug reported${terminate ? " and marked terminal" : ""}: ${summary}` }],
+				details: { action: "report_bug_in_workflow" },
+			};
+		},
+	});
 	pi.registerCommand("orchestrate", {
 		description: "Start an agent-directed orchestration task",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const taskInput = args.trim();
-			if (!taskInput) {
-				ctx.ui.notify("Usage: /orchestrate <task description>", "warning");
+			const parsedArgs = parseOrchestrateArgs(args, ctx.cwd);
+			if (parsedArgs.error || !parsedArgs.repoPath || !parsedArgs.taskInput) {
+				ctx.ui.notify(parsedArgs.error ?? "Usage: /orchestrate <repo-path> -- <task description>", "warning");
 				return;
 			}
+			const { repoPath, taskInput } = parsedArgs;
 			const tasks = loadPersistedTasks(ctx);
 			const running = Array.from(tasks.values()).find((task) => task.status === "running");
 			if (running) {
@@ -1346,7 +1779,7 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(`Missing required agents: ${missing.join(", ")}`, "error");
 				return;
 			}
-			const state = newTaskState(taskInput, ctx.cwd);
+			const state = newTaskState(taskInput, repoPath);
 			recordProgress(pi, ctx, state, "received", "Task received");
 			try {
 				await runWorkflow(pi, ctx, state, agents);
@@ -1373,6 +1806,24 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 			}
 			const lines = tasks.slice(0, 10).map((task) => `${task.id} | ${task.status} | ${task.stage} | ${task.currentAgent ?? "idle"} | ${task.title}`);
 			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+	pi.registerCommand("orchestrate-stop", {
+		description: "Request stop for a running task: /orchestrate-stop <task-id>",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const taskId = args.trim();
+			if (!taskId) {
+				ctx.ui.notify("Usage: /orchestrate-stop <task-id>", "warning");
+				return;
+			}
+			const task = loadTaskById(ctx, taskId);
+			if (!task) {
+				ctx.ui.notify(`Task not found: ${taskId}`, "error");
+				return;
+			}
+			writeStopRequest(task.repoPath, task, `Stop requested at ${nowIso()}`);
+			recordProgress(pi, ctx, task, task.stage === "done" ? "done" : task.stage, "Stop requested by /orchestrate-stop");
+			ctx.ui.notify(`Stop requested for ${taskId}`, "info");
 		},
 	});
 	pi.registerCommand("orchestrate-widget", {

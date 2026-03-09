@@ -20,7 +20,7 @@ Spec generation, implementation, and review are dispatcher-based: Pi subagents c
 1. Open this repo in `pi`.
 2. Run `/reload` so project-local extensions/agents are loaded.
 3. Start an autonomous task:
-   - `/orchestrate <your full task>`
+   - `/orchestrate <repo-path> -- <your full task>`
 4. Check progress:
    - `/orchestrate-status`
    - `/orchestrate-log <task-id>`
@@ -36,6 +36,8 @@ Spec generation, implementation, and review are dispatcher-based: Pi subagents c
      - real-time streamed events from delegated agents (`stream` mode)
 5. Resume a failed/interrupted task:
    - `/orchestrate-resume <task-id>`
+6. Stop a running task:
+   - `/orchestrate-stop <task-id>`
 
 ## Local Web UI
 
@@ -51,6 +53,7 @@ Run a local React dashboard for the orchestrator:
 The dashboard reads task artifacts from `.pi/reports/` and `.pi/specs/`.
 Running tasks are exposed via live snapshot files written to:
 - `.pi/reports/<task-id>.state.json`
+- `.pi/reports/<task-id>.progress.md`
 
 ## Outputs
 
@@ -84,14 +87,23 @@ Dispatcher prompt templates are stored in:
   - `amp-implementation-dispatch.md`
   - `codex-review-dispatch.md`
 
-The orchestrator accepts normal natural-language responses from delegated agents.
-JSON is optional; when present it is used directly, otherwise the orchestrator parses structured sections heuristically.
-For deterministic control flow, delegated agents should include a tiny `DECISION` block:
-- `status: approved | needs_changes | failed | passed`
-- `blocking: yes | no`
-- `loop_back_to: implementation | review | validation | none`
-- `pr_url: <url or empty>`
-Then they can use normal English in `DETAILS`.
+The orchestrator is agent-directed:
+- control flow comes from `handoff` and `finish` tool calls
+- free-form prose is for humans, not routing
+- dispatcher agents must delegate coding/review work to `codex` or `amp`, not implement directly
+- stage agents use a narrow tool protocol:
+  - `write_prompt`
+  - `dispatch_coding_agent`
+  - `append_progress`
+  - `handoff`
+  - `finish`
+  - `report_bug_in_workflow`
+
+Shared run context:
+- `.pi/reports/<task-id>.progress.md` is the compact shared memory for the run
+- it is passed into every stage-agent prompt
+- it is also passed into delegated `codex` / `amp` prompts
+- detailed transfer context still belongs in handoff messages
 
 Review policy:
 - P0/P1 findings are always blocking.
@@ -105,10 +117,11 @@ Runtime prompt guardrails injected into every subagent system prompt:
 - active branch name
 - explicit instruction not to clone the repo again
 
-Repository path derivation:
-- `repoPath` is derived from an explicit repository path in the task text when present (for example `~/Projects/claw-social`), otherwise it falls back to the Pi session cwd.
-- That path is written into task state and into the generated spec metadata.
-- All later stages read from task state, not transient cwd.
+Repository path handling:
+- `repoPath` is required up front via `/orchestrate <repo-path> -- <task>`
+- the path must resolve to a git repository root
+- that path is written into task state and into the generated spec metadata
+- all later stages read from task state, not transient cwd
 
 Context continuity between agents:
 - Spec text is passed directly into implementation/review/validation prompts.

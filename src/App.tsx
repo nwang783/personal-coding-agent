@@ -31,6 +31,7 @@ function App() {
   const [tasksError, setTasksError] = useState<string>();
   const [detailError, setDetailError] = useState<string>();
   const [activeTab, setActiveTab] = useState<ViewTab>("pipeline");
+  const [stopPending, setStopPending] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -86,6 +87,25 @@ function App() {
 
   const selectedTask = detail?.task;
 
+  async function requestStop(taskId: string): Promise<void> {
+    setStopPending(true);
+    try {
+      const response = await fetch(`/api/tasks/${taskId}/stop`, { method: "POST" });
+      if (!response.ok) {
+        throw new Error(`Stop request failed: ${response.status}`);
+      }
+      setDetail((current) =>
+        current && current.task.id === taskId
+          ? { ...current, task: { ...current.task, stopRequested: true } }
+          : current,
+      );
+    } catch (error) {
+      setDetailError(error instanceof Error ? error.message : "Unable to stop task");
+    } finally {
+      setStopPending(false);
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -116,13 +136,13 @@ function App() {
               <strong>{task.title.replace(/^"|"$/g, "")}</strong>
               <p>{task.lastNote ?? "No recent note"}</p>
               <div className="task-meta">
-                <span>{task.currentAgent ?? task.routedAgent ?? "idle"}</span>
+                <span>{task.currentAgent ?? "idle"}</span>
                 <span>
                   H {task.handoffCount} · R {task.reviewLoops}/{task.maxReviewLoops} · V {task.validationLoops}/{task.maxValidationLoops}
                 </span>
               </div>
               <div className="task-meta">
-                <span>{task.failureKind ?? task.activeAgentName ?? "idle"}</span>
+                <span>{task.stopRequested ? "stop requested" : task.failureKind ?? task.lastProgressLine ?? ""}</span>
                 <span>{formatTime(task.updatedAt)}</span>
               </div>
             </button>
@@ -166,6 +186,18 @@ function App() {
                 <h2>{selectedTask.title.replace(/^"|"$/g, "")}</h2>
                 <p className="hero-copy">{selectedTask.originalTask}</p>
               </div>
+              {selectedTask.status === "running" ? (
+                <div className="hero-actions">
+                  <button
+                    className="tab-btn"
+                    disabled={stopPending || selectedTask.stopRequested}
+                    onClick={() => requestStop(selectedTask.id)}
+                    type="button"
+                  >
+                    {selectedTask.stopRequested ? "Stop requested" : stopPending ? "Stopping..." : "Stop run"}
+                  </button>
+                </div>
+              ) : null}
               <div className="hero-metrics">
                 <div className="metric">
                   <span>Status</span>
@@ -177,7 +209,7 @@ function App() {
                 </div>
                 <div className="metric">
                   <span>Active agent</span>
-                  <strong>{selectedTask.currentAgent ?? selectedTask.activeAgentName ?? "idle"}</strong>
+                  <strong>{selectedTask.currentAgent ?? "idle"}</strong>
                 </div>
                 <div className="metric">
                   <span>Updated</span>
@@ -187,6 +219,9 @@ function App() {
             </header>
 
             {detailError ? <section className="empty-state">{detailError}</section> : null}
+            {selectedTask.stopRequested ? (
+              <section className="empty-state">Stop requested. The active subagent will be terminated shortly.</section>
+            ) : null}
 
             <section className="grid two-up">
               <article className="panel">
@@ -228,6 +263,10 @@ function App() {
                     <dd>{selectedTask.lastPromptPath ?? "n/a"}</dd>
                   </div>
                   <div>
+                    <dt>Progress</dt>
+                    <dd>{selectedTask.progressPath ?? "n/a"}</dd>
+                  </div>
+                  <div>
                     <dt>Result</dt>
                     <dd>{selectedTask.lastResultPath ?? "n/a"}</dd>
                   </div>
@@ -264,7 +303,7 @@ function App() {
               </article>
             </section>
 
-            <section className="grid three-up">
+            <section className="grid two-up">
               <article className="panel">
                 <div className="panel-header">
                   <h3>Handoff history</h3>
@@ -286,25 +325,6 @@ function App() {
 
               <article className="panel">
                 <div className="panel-header">
-                  <h3>Agent stream</h3>
-                  <span>{selectedTask.streamEvents?.length ?? 0} items</span>
-                </div>
-                <div className="timeline">
-                  {(selectedTask.streamEvents ?? []).slice().reverse().map((entry) => (
-                    <div key={`${entry.at}-${entry.agent}-${entry.text}`} className="timeline-entry">
-                      <span>
-                        {entry.agent} · {entry.kind}
-                      </span>
-                      <strong>{entry.text}</strong>
-                      <time>{formatTime(entry.at)}</time>
-                    </div>
-                  ))}
-                  {selectedTask.streamEvents?.length ? null : <p className="muted">No stream events captured yet.</p>}
-                </div>
-              </article>
-
-              <article className="panel">
-                <div className="panel-header">
                   <h3>Trace files</h3>
                   <span>{detail?.traceFiles.length ?? 0} files</span>
                 </div>
@@ -320,15 +340,92 @@ function App() {
               </article>
             </section>
 
+            {(selectedTask.streamEvents ?? []).length > 0 && (
+              <section className="panel" style={{ marginBottom: 16 }}>
+                <div className="panel-header">
+                  <h3>Agent stream</h3>
+                  <span>{selectedTask.streamEvents!.length} events</span>
+                </div>
+                <div className="timeline">
+                  {selectedTask.streamEvents!.slice().reverse().map((entry, i) => (
+                    <div key={`${entry.at}-${entry.agent}-${i}`} className="timeline-entry">
+                      <span>
+                        {entry.agent} · {entry.kind}
+                      </span>
+                      <strong>{entry.text}</strong>
+                      <time>{formatTime(entry.at)}</time>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
             <section className="grid two-up">
               <article className="panel">
                 <div className="panel-header">
-                  <h3>Spec / kickoff preview</h3>
-                  <span>{selectedTask.specPath ?? "n/a"}</span>
+                  <h3>Progress</h3>
+                  <span>shared run memory</span>
                 </div>
-                <pre>{detail?.summaries.specPreview ?? "No spec preview available."}</pre>
+                {detail?.summaries.progressPreview ? <pre>{detail.summaries.progressPreview}</pre> : <p className="muted">No progress yet.</p>}
+                {(selectedTask.progressEntries ?? []).length > 0 && (
+                  <div className="timeline" style={{ marginTop: 12 }}>
+                    {(selectedTask.progressEntries ?? []).map((entry, i) => (
+                      <div key={`${entry.at}-${i}`} className="timeline-entry">
+                        <span>{entry.agent}</span>
+                        <strong>{entry.line}</strong>
+                        <time>{formatTime(entry.at)}</time>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </article>
+              <article className="panel">
+                <div className="panel-header">
+                  <h3>Delegated Run</h3>
+                  <span>{selectedTask.lastDispatchPromptPath ? "latest" : "none"}</span>
+                </div>
+                <div className="stack">
+                  <div className="mini-block">
+                    <h4>Dispatch Prompt</h4>
+                    <p>{selectedTask.lastDispatchPromptPath ?? "n/a"}</p>
+                  </div>
+                  <div className="mini-block">
+                    <h4>Dispatch Result</h4>
+                    <p>{selectedTask.lastDispatchResultPath ?? "n/a"}</p>
+                  </div>
+                  {selectedTask.lastDispatchProvider && (
+                    <div className="mini-block">
+                      <h4>Provider</h4>
+                      <p>{selectedTask.lastDispatchProvider}</p>
+                    </div>
+                  )}
+                </div>
+              </article>
+            </section>
 
+            {(selectedTask.dispatchHistory ?? []).length > 0 && (
+              <section className="panel" style={{ marginBottom: 16 }}>
+                <div className="panel-header">
+                  <h3>Dispatch history</h3>
+                  <span>{selectedTask.dispatchHistory.length} dispatches</span>
+                </div>
+                <div className="timeline">
+                  {selectedTask.dispatchHistory.slice().reverse().map((d, i) => (
+                    <div key={`${d.at}-${i}`} className="timeline-entry">
+                      <span>
+                        {d.agent} → {d.provider} · {d.taskKind}
+                        {d.timedOut ? " · TIMEOUT" : ""}
+                        {d.timing !== undefined ? ` · ${Math.round(d.timing / 1000)}s` : ""}
+                      </span>
+                      <strong>{d.resultSummary ?? d.promptPreview ?? "dispatched"}</strong>
+                      <time>{formatTime(d.at)}</time>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            <section className="grid two-up">
               <article className="panel">
                 <div className="panel-header">
                   <h3>Latest prompt</h3>
@@ -336,9 +433,7 @@ function App() {
                 </div>
                 <pre>{detail?.summaries.promptPreview ?? "No prompt preview available."}</pre>
               </article>
-            </section>
 
-            <section className="grid two-up">
               <article className="panel">
                 <div className="panel-header">
                   <h3>Latest result</h3>
@@ -346,15 +441,23 @@ function App() {
                 </div>
                 <pre>{detail?.summaries.resultPreview ?? "No result preview available."}</pre>
               </article>
-
-              <article className="panel">
-                <div className="panel-header">
-                  <h3>Final report / live log</h3>
-                  <span>{selectedTask.eventLogPath ?? selectedTask.liveLogPath ?? "n/a"}</span>
-                </div>
-                <pre>{selectedTask.finalReport ?? (detail?.liveLogTail.join("\n") || "No live log yet.")}</pre>
-              </article>
             </section>
+
+            {(selectedTask.finalReport || detail?.summaries.reportPreview) && (
+              <section className="panel" style={{ marginBottom: 16 }}>
+                <div className="panel-header">
+                  <h3>Final report</h3>
+                </div>
+                <pre>{selectedTask.finalReport ?? detail?.summaries.reportPreview}</pre>
+              </section>
+            )}
+
+            {selectedTask.workflowBugReport && (
+              <section className="empty-state" style={{ background: "rgba(197,48,48,0.06)", borderColor: "rgba(197,48,48,0.2)", color: "var(--bad)" }}>
+                <strong>Workflow bug reported</strong>
+                <p>{selectedTask.workflowBugReport}</p>
+              </section>
+            )}
             </>
             )}
           </>

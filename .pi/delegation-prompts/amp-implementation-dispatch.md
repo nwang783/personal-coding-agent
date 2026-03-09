@@ -14,6 +14,10 @@ Your job:
    - Unresolved Risks
 
 Hard requirements:
+- The payload will include both a repository root path and an active worktree path.
+- Make all code changes only inside the provided worktree path.
+- Use the repository root path only as context; do not edit there directly if it differs from the worktree path.
+- Do not inspect or modify sibling repos or any other checkout on disk.
 - Preserve architectural consistency and compatibility.
 
 Task/spec payload follows after this line.

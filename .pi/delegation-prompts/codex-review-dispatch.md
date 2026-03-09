@@ -19,6 +19,9 @@ Your job:
    - CI Status
 
 Hard requirements:
+- The payload will include both a repository root path and an active worktree path.
+- Review and any git operations must be executed only from the provided worktree path.
+- Use the repository root path only as context; do not inspect or modify unrelated repos or sibling checkouts.
 - P0/P1 issues must be clearly marked as blocking.
 - `fixInstructions` must be actionable.
 

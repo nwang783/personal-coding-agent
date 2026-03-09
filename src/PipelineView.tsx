@@ -142,22 +142,19 @@ export default function PipelineView({ detail }: Props) {
   const nodeById = Object.fromEntries(STAGE_NODES.map((n) => [n.id, n]));
 
   function agentForNode(nodeId: string): string {
-    if (nodeId === "implementation" || nodeId === "fixing") return task.currentAgent ?? task.routedAgent ?? "impl-agent";
+    if (nodeId === "implementation" || nodeId === "fixing") return task.currentAgent ?? "impl-agent";
     return nodeById[nodeId]?.defaultAgent ?? "";
   }
 
   return (
     <div className="pipeline-view">
       {/* Live agent banner */}
-      {(task.currentAgent || task.activeAgentName) && task.status === "running" && (
+      {(task.currentAgent) && task.status === "running" && (
         <div className="pipeline-live-banner">
           <span className="pipeline-live-dot" />
-          <strong>{task.currentAgent ?? task.activeAgentName}</strong>
-          {task.activeAgentPurpose && (
-            <span className="pipeline-live-purpose">{task.activeAgentPurpose}</span>
-          )}
-          {task.lastStreamEvent && (
-            <span className="pipeline-live-event">{task.lastStreamEvent}</span>
+          <strong>{task.currentAgent}</strong>
+          {task.lastDispatchProvider && (
+            <span className="pipeline-live-purpose">via {task.lastDispatchProvider}</span>
           )}
         </div>
       )}
@@ -264,7 +261,7 @@ export default function PipelineView({ detail }: Props) {
         </div>
         <div className="pipeline-stat">
           <span className="pipeline-stat-label">Current agent</span>
-          <span className="pipeline-stat-value">{task.currentAgent ?? task.activeAgentName ?? "idle"}</span>
+          <span className="pipeline-stat-value">{task.currentAgent ?? "idle"}</span>
         </div>
         {task.lastPrUrl && (
           <div className="pipeline-stat">
@@ -279,6 +276,67 @@ export default function PipelineView({ detail }: Props) {
         <div className="pipeline-failure-banner">
           <strong>Failed: {task.failureKind}</strong>
           {task.failureDetails && <p>{task.failureDetails}</p>}
+        </div>
+      )}
+
+      {task.workflowBugReport && (
+        <div className="pipeline-failure-banner">
+          <strong>Workflow bug reported</strong>
+          <p>{task.workflowBugReport}</p>
+        </div>
+      )}
+
+      {/* Progress log */}
+      {(task.progressEntries ?? []).length > 0 && (
+        <div className="pipeline-handoff-section">
+          <h3 className="pipeline-section-title">Progress</h3>
+          <div className="pipeline-progress-log">
+            {(task.progressEntries ?? []).map((entry, i) => (
+              <div key={`${entry.at}-${i}`} className="pipeline-progress-entry">
+                <span className="pipeline-handoff-agent-badge">{entry.agent}</span>
+                <span className="pipeline-progress-line">{entry.line}</span>
+                <time>{formatTime(entry.at)}</time>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Dispatch history */}
+      {(task.dispatchHistory ?? []).length > 0 && (
+        <div className="pipeline-handoff-section">
+          <h3 className="pipeline-section-title">Dispatch history</h3>
+          <div className="pipeline-handoff-chain">
+            {(task.dispatchHistory ?? []).map((d, i) => (
+              <div key={`${d.at}-${i}`} className="pipeline-handoff-item">
+                <div className="pipeline-handoff-header">
+                  <span className="pipeline-handoff-agents">
+                    <span className="pipeline-handoff-agent-badge">{d.agent}</span>
+                    <span className="pipeline-handoff-arrow">→</span>
+                    <span className={`pill ${d.provider === "codex" ? "prompt" : "result"}`}>{d.provider}</span>
+                    <span className={`pill`}>{d.taskKind}</span>
+                  </span>
+                  <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    {d.timedOut && <span className="pill bad">timeout</span>}
+                    {d.timing !== undefined && <span style={{ fontFamily: "var(--mono)", fontSize: "0.72rem", color: "var(--muted)" }}>{Math.round(d.timing / 1000)}s</span>}
+                    <time>{formatTime(d.at)}</time>
+                  </span>
+                </div>
+                {d.promptPreview && (
+                  <details className="pipeline-handoff-message">
+                    <summary>Prompt preview</summary>
+                    <pre>{d.promptPreview}</pre>
+                  </details>
+                )}
+                {d.resultSummary && (
+                  <details className="pipeline-handoff-message">
+                    <summary>Result summary</summary>
+                    <pre>{d.resultSummary}</pre>
+                  </details>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
