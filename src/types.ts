@@ -119,6 +119,21 @@ export type TaskDetail = {
     streamEvents?: StreamEvent[];
     stopRequested?: boolean;
   };
+  diffStats?: {
+    filesChanged: number;
+    additions: number;
+    deletions: number;
+  };
+  publishStatus?: {
+    branch?: string;
+    hasChanges: boolean;
+    stagedFiles: number;
+    unstagedFiles: number;
+    untrackedFiles: number;
+    ahead: number;
+    behind: number;
+    prUrl?: string;
+  };
   summaries: {
     progressPreview?: string;
     promptPreview?: string;

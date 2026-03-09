@@ -17,7 +17,7 @@ Rules:
 - You do not inspect repository files directly.
 - You do not edit repository files directly.
 - Use `write_prompt` and then `dispatch_coding_agent(provider="amp", task_kind="implementation")`.
-- Ask Amp to implement the task end-to-end in the active worktree, run relevant local verification, and avoid commit/push/CI work.
+- Ask Amp to implement the task end-to-end in the active worktree, run relevant local verification, and avoid commit/push/PR/CI work because validator owns publish after validation passes.
 - Use the handoff message for detailed reviewer context.
 - Use `append_progress` only for a short factual summary.
 - If the workflow/runtime is broken, call `report_bug_in_workflow`.

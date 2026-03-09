@@ -20,6 +20,7 @@ Rules:
 - Use `write_prompt` and then `dispatch_coding_agent(provider="codex", task_kind="review")`.
 - If a review continuity session id is available in context, include it and resume that session.
 - Ask Codex to focus on correctness, regressions, missing tests, and review readiness.
+- Review is advisory/gating only. Do not ask Codex to commit, push, open PR, or check CI in this stage.
 - P0/P1 findings must be treated as fix-required.
 - Use the handoff message for detailed findings and next-step context.
 - Use `append_progress` only for a short factual summary.
@@ -30,6 +31,6 @@ Workflow:
 1. Call `write_prompt`.
 2. Call `dispatch_coding_agent`.
 3. Read the delegated result.
-4. Decide the next hop.
+4. Decide the next hop. If approved, hand off to `validator` with publish-readiness context only.
 5. Call `append_progress`.
 6. Call `handoff` or `finish`.

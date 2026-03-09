@@ -1,7 +1,7 @@
 # personal-coding-agent
 
-Pi.dev autonomous orchestrator setup for spec -> implement -> review/fix -> validation -> final report.
-Reviewer agent is configured to own git integration: commit/push, CI status checks, and PR updates.
+Pi.dev autonomous orchestrator setup for spec -> implement -> review/fix -> validation/publish -> final report.
+Validator agent is configured to own publish integration after successful runtime validation: commit/push, PR creation, and CI status capture.
 Spec generation, implementation, and review are dispatcher-based: Pi subagents call external `codex`/`amp` CLIs instead of directly doing those steps.
 
 ## Included
@@ -127,6 +127,7 @@ Context continuity between agents:
 - Spec text is passed directly into implementation/review/validation prompts.
 - Review and validation also receive previous stage summaries.
 - Reviewer can reuse a persistent `codex_session_id` for continuity across review loops.
+- Validator owns publish actions only after the change has passed runtime validation.
 
 ## Runtime controls
 
