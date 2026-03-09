@@ -513,12 +513,20 @@ pre {
   color: var(--text);
 }
 
+/* ── Top bar ────────────────────────────────────────────── */
+
+.top-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
 /* ── Tab bar ────────────────────────────────────────────── */
 
 .tab-bar {
   display: flex;
   gap: 2px;
-  margin-bottom: 20px;
   background: var(--line);
   border-radius: var(--radius);
   padding: 3px;
@@ -548,6 +556,22 @@ pre {
   background: #ffffff;
   color: var(--accent);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.tab-btn.stop-btn {
+  background: rgba(197, 48, 48, 0.1);
+  color: var(--bad);
+}
+
+.tab-btn.stop-btn:hover {
+  background: var(--bad);
+  color: #fff;
+}
+
+.tab-btn.stop-btn:disabled {
+  background: rgba(197, 48, 48, 0.06);
+  color: rgba(197, 48, 48, 0.4);
+  cursor: not-allowed;
 }
 
 /* ── Pipeline view ─────────────────────────────────────── */

@@ -123,6 +123,8 @@ export type TaskDetail = {
     progressPreview?: string;
     promptPreview?: string;
     resultPreview?: string;
+    dispatchPromptPreview?: string;
+    dispatchResultPreview?: string;
     reportPreview?: string;
   };
   traceFiles: Array<{

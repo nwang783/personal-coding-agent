@@ -158,22 +158,34 @@ function App() {
           </section>
         ) : (
           <>
-            {/* Tab bar */}
-            <div className="tab-bar">
-              <button
-                className={`tab-btn ${activeTab === "pipeline" ? "active" : ""}`}
-                onClick={() => setActiveTab("pipeline")}
-                type="button"
-              >
-                Pipeline
-              </button>
-              <button
-                className={`tab-btn ${activeTab === "detail" ? "active" : ""}`}
-                onClick={() => setActiveTab("detail")}
-                type="button"
-              >
-                Detail
-              </button>
+            {/* Top bar */}
+            <div className="top-bar">
+              <div className="tab-bar">
+                <button
+                  className={`tab-btn ${activeTab === "pipeline" ? "active" : ""}`}
+                  onClick={() => setActiveTab("pipeline")}
+                  type="button"
+                >
+                  Pipeline
+                </button>
+                <button
+                  className={`tab-btn ${activeTab === "detail" ? "active" : ""}`}
+                  onClick={() => setActiveTab("detail")}
+                  type="button"
+                >
+                  Detail
+                </button>
+              </div>
+              {selectedTask.status === "running" ? (
+                <button
+                  className="tab-btn stop-btn"
+                  disabled={stopPending || selectedTask.stopRequested}
+                  onClick={() => requestStop(selectedTask.id)}
+                  type="button"
+                >
+                  {selectedTask.stopRequested ? "Stop requested" : stopPending ? "Stopping..." : "Stop run"}
+                </button>
+              ) : null}
             </div>
 
             {activeTab === "pipeline" && detail ? (
@@ -186,18 +198,6 @@ function App() {
                 <h2>{selectedTask.title.replace(/^"|"$/g, "")}</h2>
                 <p className="hero-copy">{selectedTask.originalTask}</p>
               </div>
-              {selectedTask.status === "running" ? (
-                <div className="hero-actions">
-                  <button
-                    className="tab-btn"
-                    disabled={stopPending || selectedTask.stopRequested}
-                    onClick={() => requestStop(selectedTask.id)}
-                    type="button"
-                  >
-                    {selectedTask.stopRequested ? "Stop requested" : stopPending ? "Stopping..." : "Stop run"}
-                  </button>
-                </div>
-              ) : null}
               <div className="hero-metrics">
                 <div className="metric">
                   <span>Status</span>
@@ -400,6 +400,18 @@ function App() {
                     </div>
                   )}
                 </div>
+                {detail?.summaries.dispatchPromptPreview && (
+                  <details style={{ marginTop: 12 }}>
+                    <summary>Latest delegated prompt</summary>
+                    <pre>{detail.summaries.dispatchPromptPreview}</pre>
+                  </details>
+                )}
+                {detail?.summaries.dispatchResultPreview && (
+                  <details style={{ marginTop: 12 }}>
+                    <summary>Latest delegated result</summary>
+                    <pre>{detail.summaries.dispatchResultPreview}</pre>
+                  </details>
+                )}
               </article>
             </section>
 

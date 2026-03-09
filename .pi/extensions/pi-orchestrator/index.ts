@@ -879,6 +879,45 @@ type DispatchCodingResult = {
 	resultPath: string;
 };
 
+const CODEX_MODEL = "gpt-5.4";
+const CODEX_REASONING_EFFORT = "medium";
+
+function getAllowedDispatchTaskKinds(agent: RuntimeAgent): Array<"spec" | "implementation" | "review" | "validation"> {
+	switch (agent) {
+		case "spec-writer":
+			return ["spec"];
+		case "codex-impl":
+		case "amp-impl":
+			return ["implementation"];
+		case "reviewer":
+			return ["review"];
+		case "validator":
+			return ["validation"];
+		case "reporter":
+			return [];
+	}
+}
+
+function buildDispatchTaskKindError(
+	agent: RuntimeAgent,
+	taskKind: "spec" | "implementation" | "review" | "validation",
+): string {
+	const allowed = getAllowedDispatchTaskKinds(agent);
+	if (allowed.length === 0) {
+		return `${agent} cannot call dispatch_coding_agent. Use finish to complete the run, or handoff if another stage should take over.`;
+	}
+	const allowedText = allowed.map((kind) => `"${kind}"`).join(", ");
+	const followUp =
+		agent === "spec-writer"
+			? `If the spec is already complete, call handoff(to_agent=...) instead of dispatch_coding_agent.`
+			: agent === "codex-impl" || agent === "amp-impl"
+				? `If implementation is already complete, call handoff(to_agent="reviewer", ...) instead of dispatch_coding_agent.`
+				: agent === "reviewer"
+					? `If review is already complete, call handoff(to_agent="validator" | "codex-impl" | "amp-impl", ...) or finish if blocked.`
+					: `If validation is already complete, call handoff(to_agent="reporter" | "codex-impl" | "amp-impl", ...) or finish if blocked.`;
+	return `${agent} cannot dispatch task_kind="${taskKind}". Allowed task_kind values for ${agent}: ${allowedText}. ${followUp}`;
+}
+
 async function dispatchCodingRun(
 	state: TaskState,
 	agentName: RuntimeAgent,
@@ -916,8 +955,30 @@ async function dispatchCodingRun(
 	const execArgs =
 		provider === "codex"
 			? resumeSessionId
-				? ["exec", "resume", resumeSessionId, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", "-",]
-				: ["exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", "-"]
+				? [
+						"exec",
+						"resume",
+						resumeSessionId,
+						"--model",
+						CODEX_MODEL,
+						"--config",
+						`reasoning_effort=\"${CODEX_REASONING_EFFORT}\"`,
+						"--dangerously-bypass-approvals-and-sandbox",
+						"--skip-git-repo-check",
+						"--json",
+						"-",
+					]
+				: [
+						"exec",
+						"--model",
+						CODEX_MODEL,
+						"--config",
+						`reasoning_effort=\"${CODEX_REASONING_EFFORT}\"`,
+						"--dangerously-bypass-approvals-and-sandbox",
+						"--skip-git-repo-check",
+						"--json",
+						"-",
+					]
 			: ["--dangerously-allow-all", "-x", "--stream-json"];
 	const command = provider === "codex" ? "codex" : "amp";
 	const result = await new Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }>((resolve) => {
@@ -1598,6 +1659,8 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"dispatch_coding_agent is the only way to run delegated coding or review work.",
 			"Do not use bash or file tools for implementation, review, or validation work.",
+			"Only dispatch the task kind for your current stage: spec-writer -> spec, implementers -> implementation, reviewer -> review, validator -> validation.",
+			"If your stage work is already complete, use handoff or finish instead of dispatch_coding_agent.",
 		],
 		parameters: Type.Object({
 			provider: Type.Union([Type.Literal("codex"), Type.Literal("amp")]),
@@ -1617,6 +1680,9 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 				task_kind: "spec" | "implementation" | "review" | "validation";
 				resume_session_id?: string;
 			};
+			if (!getAllowedDispatchTaskKinds(activeAgent).includes(task_kind)) {
+				throw new Error(buildDispatchTaskKindError(activeAgent, task_kind));
+			}
 			const state = loadToolTaskState();
 			const result = await dispatchCodingRun(state, activeAgent, provider, task_kind, resume_session_id);
 			if (result.sessionId && task_kind === "review") {
