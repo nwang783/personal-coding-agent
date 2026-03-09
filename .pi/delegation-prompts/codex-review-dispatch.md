@@ -10,15 +10,7 @@ Your job:
    - push branch
    - open/update PR
    - check CI status and summarize results
-4. Output format:
-   - A short `DECISION` block:
-     - status: approved | needs_changes | failed
-     - blocking: yes | no
-     - loop_back_to: implementation | review | validation | none
-     - pr_url: <url or empty>
-     - codex_session_id: <session id used for this review>
-   - Then free-form `DETAILS` in normal English.
-5. In `DETAILS`, prefer sections:
+4. In your response, prefer sections:
    - Approval (approved / not approved)
    - Blocking Findings (with P0-P3)
    - Non-blocking Findings

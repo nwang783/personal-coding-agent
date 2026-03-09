@@ -37,11 +37,27 @@ Spec generation, implementation, and review are dispatcher-based: Pi subagents c
 5. Resume a failed/interrupted task:
    - `/orchestrate-resume <task-id>`
 
+## Local Web UI
+
+Run a local React dashboard for the orchestrator:
+
+1. Install frontend dependencies:
+   - `npm install`
+2. Start the local Vite app:
+   - `npm run webui:dev`
+3. Open:
+   - `http://127.0.0.1:4173`
+
+The dashboard reads task artifacts from `.pi/reports/` and `.pi/specs/`.
+Running tasks are exposed via live snapshot files written to:
+- `.pi/reports/<task-id>.state.json`
+
 ## Outputs
 
 - Central spec files: `.pi/specs/<task-id>.md`
 - Final reports:
   - `.pi/reports/<task-id>.json`
+  - `.pi/reports/<task-id>.state.json` (live task snapshot for local UI)
   - `.pi/reports/<task-id>.md`
   - `.pi/reports/<task-id>.live.log` (stage-by-stage plus stream events)
   - `.pi/reports/<task-id>.trace/` (exact subagent prompts/results + per-call meta)
