@@ -1,20 +1,26 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 
 type TaskStatus = "queued" | "running" | "completed" | "failed";
-type TaskStage =
-	| "received"
-	| "spec"
-	| "implementation"
-	| "review"
-	| "fixing"
-	| "validation"
-	| "reporting"
-	| "done"
-	| "failed";
+type TaskStage = "received" | "spec" | "implementation" | "review" | "validation" | "reporting" | "done" | "failed";
+type RuntimeAgent = "spec-writer" | "codex-impl" | "amp-impl" | "reviewer" | "validator" | "reporter";
+type HandoffTarget = Exclude<RuntimeAgent, "spec-writer">;
+type FailureKind =
+	| "subprocess_error"
+	| "timeout"
+	| "missing_handoff"
+	| "invalid_transition"
+	| "protocol_violation"
+	| "max_loops_exceeded"
+	| "tool_error"
+	| "workflow_bug_reported"
+	| "stopped";
+type WidgetMode = "compact" | "handoff" | "prompt" | "result" | "history" | "stream";
 
 type ReviewFinding = {
 	severity: "P0" | "P1" | "P2" | "P3";
@@ -23,6 +29,116 @@ type ReviewFinding = {
 	file?: string;
 	line?: number;
 };
+
+type VerificationItem = {
+	command: string;
+	outcome: "passed" | "failed" | "not_run";
+	details: string;
+};
+
+type CiCheck = {
+	name: string;
+	status: "passed" | "failed" | "pending" | "not_run";
+	details: string;
+};
+
+type ArtifactBag = {
+	branch?: string;
+	commits?: string[];
+	pr_url?: string | null;
+	changed_files?: string[];
+	findings?: ReviewFinding[];
+	issues?: string[];
+	verification?: VerificationItem[];
+	codex_session_id?: string | null;
+	ci_checks?: CiCheck[];
+	[key: string]: unknown;
+};
+
+type HandoffPayload = {
+	toAgent: HandoffTarget;
+	message: string;
+	summary: string;
+	artifacts?: ArtifactBag;
+	reason?: string;
+};
+
+type FinishPayload = {
+	outcome: "completed" | "failed";
+	summary: string;
+	report: string;
+	artifacts?: ArtifactBag;
+};
+
+type WorkflowBugPayload = {
+	summary: string;
+	details: string;
+	terminate: boolean;
+};
+
+type HandoffRecord = {
+	at: string;
+	fromAgent: RuntimeAgent;
+	toAgent: HandoffTarget;
+	summary: string;
+	message: string;
+	reason?: string;
+	artifacts?: ArtifactBag;
+};
+
+type EventRecord =
+	| {
+			type: "task_started" | "task_resumed";
+			at: string;
+			taskId: string;
+			repoPath: string;
+			worktreePath?: string;
+			worktreeBranch?: string;
+	  }
+	| {
+			type: "agent_started";
+			at: string;
+			taskId: string;
+			agent: RuntimeAgent;
+			stage: TaskStage;
+			promptPath: string;
+	  }
+	| {
+			type: "agent_completed";
+			at: string;
+			taskId: string;
+			agent: RuntimeAgent;
+			stage: TaskStage;
+			resultPath: string;
+			durationMs: number;
+			exitCode: number;
+			toolSignals: number;
+	  }
+	| {
+			type: "handoff";
+			at: string;
+			taskId: string;
+			fromAgent: RuntimeAgent;
+			toAgent: HandoffTarget;
+			summary: string;
+			reason?: string;
+	  }
+	| {
+			type: "finish";
+			at: string;
+			taskId: string;
+			agent: RuntimeAgent;
+			outcome: "completed" | "failed";
+			summary: string;
+	  }
+	| {
+			type: "failure";
+			at: string;
+			taskId: string;
+			agent?: RuntimeAgent;
+			kind: FailureKind;
+			details: string;
+	  };
 
 type TaskState = {
 	id: string;
@@ -37,30 +153,43 @@ type TaskState = {
 	updatedAt: string;
 	specPath?: string;
 	liveLogPath?: string;
+	liveStatePath?: string;
 	traceDir?: string;
 	reportJsonPath?: string;
 	reportMarkdownPath?: string;
-	routedAgent?: "codex-impl" | "amp-impl";
+	eventLogPath?: string;
+	progressPath?: string;
+	promptDraftPath?: string;
 	reviewLoops: number;
 	validationLoops: number;
 	maxReviewLoops: number;
 	maxValidationLoops: number;
-	lastImplSummary?: string;
+	handoffCount: number;
+	currentAgent?: RuntimeAgent;
+	routedAgent?: "codex-impl" | "amp-impl";
+	lastHandoff?: HandoffRecord;
+	handoffHistory: HandoffRecord[];
+	failureKind?: FailureKind;
+	failureDetails?: string;
 	lastBranchName?: string;
 	lastCommitShas?: string[];
 	lastPrUrl?: string;
 	lastPrFailureReason?: string;
-	lastReviewSummary?: string;
-	lastValidationSummary?: string;
 	codexReviewSessionId?: string;
 	blockingFindings: ReviewFinding[];
 	validationIssues: string[];
+	lastVerification?: VerificationItem[];
+	lastCiChecks?: CiCheck[];
+	lastArtifacts?: ArtifactBag;
+	finalReport?: string;
 	history: Array<{ at: string; stage: TaskStage; note: string }>;
 	traceSeq?: number;
 	activeAgentName?: string;
 	activeAgentPurpose?: string;
 	lastPromptPath?: string;
 	lastResultPath?: string;
+	lastDispatchPromptPath?: string;
+	lastDispatchResultPath?: string;
 	lastSubagentCommand?: string;
 	lastStreamEvent?: string;
 	streamEvents?: Array<{ at: string; agent: string; purpose: string; kind: string; text: string }>;
@@ -68,13 +197,18 @@ type TaskState = {
 };
 
 type AgentConfig = {
-	name: string;
+	name: RuntimeAgent;
 	description: string;
 	tools?: string[];
 	model?: string;
 	systemPrompt: string;
 	filePath: string;
 };
+
+type ToolSignal =
+	| { kind: "handoff"; payload: HandoffPayload }
+	| { kind: "finish"; payload: FinishPayload }
+	| { kind: "workflow_bug"; payload: WorkflowBugPayload };
 
 type SubagentRun = {
 	ok: boolean;
@@ -86,7 +220,13 @@ type SubagentRun = {
 	toolEventCount: number;
 	deltaCount: number;
 	durationMs: number;
+	timedOut: boolean;
+	stopRequested: boolean;
+	toolSignals: ToolSignal[];
 };
+
+const WIDGET_MODES: WidgetMode[] = ["compact", "handoff", "prompt", "result", "history", "stream"];
+const ORCHESTRATOR_EXTENSION_PATH = "/Users/nathanwang/Projects/personal-coding-agent/.pi/extensions/pi-orchestrator/index.ts";
 
 function nowIso(): string {
 	return new Date().toISOString();
@@ -111,30 +251,45 @@ function isGitRepoRoot(candidate: string): boolean {
 	}
 }
 
-function deriveRepoPathFromTask(taskInput: string, fallbackCwd: string): string {
-	const candidates = new Set<string>();
-	const raw = taskInput.trim();
+function resolveRepoPath(repoInput: string, cwd: string): string | undefined {
+	if (!repoInput.trim()) return undefined;
+	const expanded = expandHome(repoInput.trim());
+	const resolved = path.resolve(cwd, expanded);
+	return isGitRepoRoot(resolved) ? resolved : undefined;
+}
 
-	for (const match of raw.matchAll(/\((~?\/[^)]+)\)/g)) {
-		candidates.add(match[1]);
+function parseOrchestrateArgs(
+	args: string,
+	cwd: string,
+): { repoPath?: string; taskInput?: string; error?: string } {
+	const raw = args.trim();
+	const divider = raw.indexOf(" -- ");
+	if (divider === -1) {
+		return { error: "Usage: /orchestrate <repo-path> -- <task description>" };
 	}
-	for (const match of raw.matchAll(/\b(~\/[^\s"')]+|\/[^\s"')]+)\b/g)) {
-		candidates.add(match[1]);
+	const repoInput = raw.slice(0, divider).trim();
+	const taskInput = raw.slice(divider + 4).trim();
+	if (!repoInput || !taskInput) {
+		return { error: "Usage: /orchestrate <repo-path> -- <task description>" };
 	}
-
-	for (const candidate of candidates) {
-		const resolved = path.resolve(expandHome(candidate));
-		if (isGitRepoRoot(resolved)) return resolved;
+	const repoPath = resolveRepoPath(repoInput, cwd);
+	if (!repoPath) {
+		return { error: `Repository path must point to a git repo root: ${repoInput}` };
 	}
-	return fallbackCwd;
+	return { repoPath, taskInput };
 }
 
 function getSubagentTimeoutMs(): number {
 	const raw = process.env.PI_ORCHESTRATOR_SUBAGENT_TIMEOUT_MS;
 	const parsed = raw ? Number(raw) : NaN;
 	if (Number.isFinite(parsed) && parsed > 0) return parsed;
-	// Default to 15 minutes per subagent call to avoid "silent hangs".
 	return 15 * 60 * 1000;
+}
+
+function getSubagentRuntimeCwd(): string {
+	const dir = path.join(os.tmpdir(), "pi-orchestrator-runtime");
+	ensureDir(dir);
+	return dir;
 }
 
 function safeFilename(input: string): string {
@@ -143,6 +298,18 @@ function safeFilename(input: string): string {
 
 function ensureDir(dir: string): void {
 	fs.mkdirSync(dir, { recursive: true });
+}
+
+function writeJsonAtomic(filePath: string, data: unknown): void {
+	ensureDir(path.dirname(filePath));
+	const tmpPath = `${filePath}.tmp`;
+	fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
+	fs.renameSync(tmpPath, filePath);
+}
+
+function appendJsonl(filePath: string, value: EventRecord): void {
+	ensureDir(path.dirname(filePath));
+	fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf-8");
 }
 
 function parseFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
@@ -177,10 +344,10 @@ function loadProjectAgents(cwd: string): Map<string, AgentConfig> {
 		if (!frontmatter.name) continue;
 		const tools = frontmatter.tools
 			?.split(",")
-			.map((t) => t.trim())
+			.map((tool) => tool.trim())
 			.filter(Boolean);
 		map.set(frontmatter.name, {
-			name: frontmatter.name,
+			name: frontmatter.name as RuntimeAgent,
 			description: frontmatter.description ?? "",
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
@@ -191,650 +358,68 @@ function loadProjectAgents(cwd: string): Map<string, AgentConfig> {
 	return map;
 }
 
-function extractJsonObject(text: string): Record<string, unknown> | undefined {
-	const fenced = text.match(/```json\s*([\s\S]*?)```/i);
-	if (fenced) {
-		try {
-			return JSON.parse(fenced[1]);
-		} catch {
-			// fall through
-		}
-	}
-
-	const firstBrace = text.indexOf("{");
-	const lastBrace = text.lastIndexOf("}");
-	if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) return undefined;
-	const candidate = text.slice(firstBrace, lastBrace + 1);
-	try {
-		return JSON.parse(candidate);
-	} catch {
-		return undefined;
+function getStageForAgent(agent: RuntimeAgent): TaskStage {
+	switch (agent) {
+		case "spec-writer":
+			return "spec";
+		case "codex-impl":
+		case "amp-impl":
+			return "implementation";
+		case "reviewer":
+			return "review";
+		case "validator":
+			return "validation";
+		case "reporter":
+			return "reporting";
 	}
 }
 
-function extractSection(text: string, heading: string): string {
-	const lines = text.split("\n");
-	const headingRegex = new RegExp(`^\\s{0,3}#{1,6}\\s*${heading}\\s*$`, "i");
-	const altHeadingRegex = new RegExp(`^\\s*${heading}\\s*:\\s*$`, "i");
-	let start = -1;
-	for (let i = 0; i < lines.length; i++) {
-		if (headingRegex.test(lines[i]) || altHeadingRegex.test(lines[i])) {
-			start = i + 1;
-			break;
-		}
+function allowedTargetsForAgent(agent: RuntimeAgent): HandoffTarget[] {
+	switch (agent) {
+		case "spec-writer":
+			return ["codex-impl", "amp-impl"];
+		case "codex-impl":
+		case "amp-impl":
+			return ["reviewer"];
+		case "reviewer":
+			return ["codex-impl", "amp-impl", "validator"];
+		case "validator":
+			return ["codex-impl", "amp-impl", "reporter"];
+		case "reporter":
+			return [];
 	}
-	if (start === -1) return "";
-	const out: string[] = [];
-	for (let i = start; i < lines.length; i++) {
-		if (/^\s{0,3}#{1,6}\s+/.test(lines[i])) break;
-		if (/^\s*[A-Za-z][A-Za-z0-9 _-]{1,40}:\s*$/.test(lines[i])) break;
-		out.push(lines[i]);
-	}
-	return out.join("\n").trim();
 }
 
-function extractBullets(section: string): string[] {
-	if (!section) return [];
-	return section
-		.split("\n")
-		.map((l) => l.trim())
-		.filter((l) => /^[-*]\s+/.test(l) || /^\d+\.\s+/.test(l))
-		.map((l) => l.replace(/^[-*]\s+/, "").replace(/^\d+\.\s+/, "").trim())
-		.filter(Boolean);
+function parseArtifacts(value: unknown): ArtifactBag | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	return value as ArtifactBag;
 }
 
-function parseYesNo(text: string, positive: RegExp[], negative: RegExp[], defaultValue: boolean): boolean {
-	const lower = text.toLowerCase();
-	for (const re of negative) if (re.test(lower)) return false;
-	for (const re of positive) if (re.test(lower)) return true;
-	return defaultValue;
-}
-
-function parseDecisionBlock(text: string): Record<string, string> {
-	const lines = text.split("\n");
-	const out: Record<string, string> = {};
-	let inDecision = false;
-	for (const raw of lines) {
-		const line = raw.trim();
-		if (!inDecision) {
-			if (/^\s{0,3}#{1,6}\s*decision\b/i.test(line) || /^decision\b\s*:?\s*$/i.test(line)) {
-				inDecision = true;
-			}
-			continue;
-		}
-		if (!line) continue;
-		if (/^\s{0,3}#{1,6}\s+/.test(line) && !/^\s{0,3}#{1,6}\s*decision\b/i.test(line)) {
-			break;
-		}
-		const item = line.replace(/^[-*]\s*/, "").trim();
-		const pair = item.match(/^(?:\*\*|__)?([A-Za-z][A-Za-z0-9 _-]{1,40})(?:\*\*|__)?\s*:\s*(.+)$/);
-		if (!pair) continue;
-		const key = pair[1]
-			.trim()
-			.toLowerCase()
-			.replace(/\s+/g, "_");
-		let value = pair[2].trim();
-		value = value.replace(/^`+|`+$/g, "");
-		if (key && value) out[key] = value;
-	}
-	return out;
-}
-
-function normalizeSpecOutput(
-	rawText: string,
-	specJson: Record<string, unknown> | undefined,
-	originalTask: string,
-): {
-	goal: string;
-	constraints: string[];
-	acceptanceCriteria: string[];
-	complexitySignals: string[];
-	implementationNotes: string[];
-	implementationPhases: string[];
-	phaseCompletionChecks: string[];
-} {
-	if (specJson) {
-		return {
-			goal: String(specJson.goal ?? originalTask),
-			constraints: Array.isArray(specJson.constraints) ? specJson.constraints.map((x) => String(x)) : [],
-			acceptanceCriteria: Array.isArray(specJson.acceptanceCriteria)
-				? specJson.acceptanceCriteria.map((x) => String(x))
-				: [],
-			complexitySignals: Array.isArray(specJson.complexitySignals)
-				? specJson.complexitySignals.map((x) => String(x))
-				: [],
-			implementationNotes: Array.isArray(specJson.implementationNotes)
-				? specJson.implementationNotes.map((x) => String(x))
-				: [],
-			implementationPhases: Array.isArray(specJson.implementationPhases)
-				? specJson.implementationPhases.map((x) => String(x))
-				: [],
-			phaseCompletionChecks: Array.isArray(specJson.phaseCompletionChecks)
-				? specJson.phaseCompletionChecks.map((x) => String(x))
-				: [],
-		};
-	}
-
-	const goal =
-		extractSection(rawText, "Goal").split("\n").find((x) => x.trim())?.trim() ??
-		rawText.split("\n").find((x) => x.trim())?.trim() ??
-		originalTask;
-	const constraints = extractBullets(extractSection(rawText, "Constraints"));
-	const acceptanceCriteria = extractBullets(extractSection(rawText, "Acceptance Criteria"));
-	const complexitySignals = extractBullets(extractSection(rawText, "Complexity Signals"));
-	const implementationNotes = extractBullets(extractSection(rawText, "Implementation Notes"));
-	const implementationPhasesPrimary = extractBullets(extractSection(rawText, "Implementation Phases"));
-	const implementationPhasesFallback = extractBullets(extractSection(rawText, "Phases"));
-	const implementationPhases =
-		implementationPhasesPrimary.length > 0 ? implementationPhasesPrimary : implementationPhasesFallback;
-	const phaseCompletionChecksPrimary = extractBullets(extractSection(rawText, "Phase Completion Checks"));
-	const phaseCompletionChecksFallback = extractBullets(extractSection(rawText, "Completion Checks"));
-	const phaseCompletionChecks =
-		phaseCompletionChecksPrimary.length > 0 ? phaseCompletionChecksPrimary : phaseCompletionChecksFallback;
+function parseHandoffPayload(args: Record<string, unknown>): HandoffPayload {
 	return {
-		goal,
-		constraints,
-		acceptanceCriteria,
-		complexitySignals,
-		implementationNotes,
-		implementationPhases,
-		phaseCompletionChecks,
+		toAgent: String(args.to_agent ?? "") as HandoffTarget,
+		message: String(args.message ?? ""),
+		summary: String(args.summary ?? ""),
+		artifacts: parseArtifacts(args.artifacts),
+		reason: args.reason ? String(args.reason) : undefined,
 	};
 }
 
-function normalizeImplementationOutput(
-	rawText: string,
-	implJson: Record<string, unknown> | undefined,
-): {
-	implementationSummary: string;
-	changedFiles: string[];
-	testCommands: string[];
-	testOutcomes: string[];
-	unresolvedRisks: string[];
-	branchName?: string;
-	commitShas?: string[];
-	prUrl?: string;
-	prFailureReason?: string;
-	decisionStatus?: string;
-	decisionBlocking?: string;
-	decisionLoopBackTo?: string;
-} {
-	if (implJson) {
-		return {
-			implementationSummary: String(implJson.implementationSummary ?? rawText),
-			changedFiles: Array.isArray(implJson.changedFiles) ? implJson.changedFiles.map((x) => String(x)) : [],
-			testCommands: Array.isArray(implJson.testCommands) ? implJson.testCommands.map((x) => String(x)) : [],
-			testOutcomes: Array.isArray(implJson.testOutcomes) ? implJson.testOutcomes.map((x) => String(x)) : [],
-			unresolvedRisks: Array.isArray(implJson.unresolvedRisks) ? implJson.unresolvedRisks.map((x) => String(x)) : [],
-			branchName: implJson.branchName ? String(implJson.branchName) : undefined,
-			commitShas: Array.isArray(implJson.commitShas) ? implJson.commitShas.map((x) => String(x)) : undefined,
-			prUrl: implJson.prUrl ? String(implJson.prUrl) : undefined,
-			prFailureReason: implJson.prFailureReason ? String(implJson.prFailureReason) : undefined,
-			decisionStatus: implJson.decisionStatus ? String(implJson.decisionStatus) : undefined,
-			decisionBlocking: implJson.decisionBlocking ? String(implJson.decisionBlocking) : undefined,
-			decisionLoopBackTo: implJson.decisionLoopBackTo ? String(implJson.decisionLoopBackTo) : undefined,
-		};
-	}
-
-	const decision = parseDecisionBlock(rawText);
-	const prUrl = rawText.match(/https?:\/\/github\.com\/[^\s)]+\/pull\/\d+/i)?.[0];
-	const branchName = rawText.match(/branch(?:\s*name)?\s*[:=-]\s*([A-Za-z0-9._/-]+)/i)?.[1];
-	const commitShas = Array.from(new Set(rawText.match(/\b[0-9a-f]{7,40}\b/gi) ?? []));
+function parseFinishPayload(args: Record<string, unknown>): FinishPayload {
 	return {
-		implementationSummary: rawText.trim() || "Implementation completed (unstructured response).",
-		changedFiles: extractBullets(extractSection(rawText, "Changed Files")),
-		testCommands: extractBullets(extractSection(rawText, "Test Commands")),
-		testOutcomes: extractBullets(extractSection(rawText, "Test Outcomes")),
-		unresolvedRisks: extractBullets(extractSection(rawText, "Unresolved Risks")),
-		branchName: decision.branch || decision.branch_name || branchName,
-		commitShas: commitShas.length > 0 ? commitShas : undefined,
-		prUrl: decision.pr_url || prUrl,
-		prFailureReason: decision.pr_failure_reason || extractSection(rawText, "PR Failure Reason") || undefined,
-		decisionStatus: decision.status,
-		decisionBlocking: decision.blocking,
-		decisionLoopBackTo: decision.loop_back_to,
+		outcome: String(args.outcome ?? "") as FinishPayload["outcome"],
+		summary: String(args.summary ?? ""),
+		report: String(args.report ?? ""),
+		artifacts: parseArtifacts(args.artifacts),
 	};
 }
 
-function normalizeReviewOutput(
-	rawText: string,
-	reviewJson: Record<string, unknown> | undefined,
-): {
-	approved: boolean;
-	blockingFindings: ReviewFinding[];
-	fixInstructions: string;
-	codexSessionId?: string;
-	branchName?: string;
-	commitShas?: string[];
-	prUrl?: string;
-	prFailureReason?: string;
-} {
-	if (reviewJson) {
-		const blocking = Array.isArray(reviewJson.blockingFindings) ? reviewJson.blockingFindings : [];
-		return {
-			approved: Boolean(reviewJson.approved),
-			blockingFindings: blocking.map((f) => {
-				const finding = f as Record<string, unknown>;
-				return {
-					severity: (String(finding.severity ?? "P2").toUpperCase() as ReviewFinding["severity"]) ?? "P2",
-					title: String(finding.title ?? "Untitled finding"),
-					description: String(finding.description ?? ""),
-					file: finding.file ? String(finding.file) : undefined,
-					line: finding.line ? Number(finding.line) : undefined,
-				};
-			}),
-			fixInstructions: String(reviewJson.fixInstructions ?? ""),
-			codexSessionId: reviewJson.codexSessionId ? String(reviewJson.codexSessionId) : undefined,
-			branchName: reviewJson.branchName ? String(reviewJson.branchName) : undefined,
-			commitShas: Array.isArray(reviewJson.commitShas) ? reviewJson.commitShas.map((x) => String(x)) : undefined,
-			prUrl: reviewJson.prUrl ? String(reviewJson.prUrl) : undefined,
-			prFailureReason: reviewJson.prFailureReason ? String(reviewJson.prFailureReason) : undefined,
-		};
-	}
-
-	const decision = parseDecisionBlock(rawText);
-	const findings: ReviewFinding[] = [];
-	const re = /(?:^|\n)\s*(?:[-*]|\d+\.)?\s*\[?(P[0-3])\]?\s*[:\-]\s*(.+)/gi;
-	for (const match of rawText.matchAll(re)) {
-		const sev = String(match[1]).toUpperCase() as ReviewFinding["severity"];
-		const body = String(match[2]).trim();
-		const [title, ...desc] = body.split(" - ");
-		findings.push({
-			severity: sev,
-			title: title.slice(0, 120),
-			description: desc.join(" - ") || body,
-		});
-	}
-	const approved = parseYesNo(
-		decision.status ?? rawText,
-		[/\bapproved\b/i, /\bpasses?\b/i, /\bno (critical|blocking) issues?\b/i],
-		[/\bnot approved\b/i, /\bfail(?:ed|s)?\b/i, /\bneeds_changes\b/i],
-		findings.length === 0,
-	);
-	const branchName = rawText.match(/branch(?:\s*name)?\s*[:=-]\s*([A-Za-z0-9._/-]+)/i)?.[1];
-	const commitShas = Array.from(new Set(rawText.match(/\b[0-9a-f]{7,40}\b/gi) ?? []));
-	const prUrl = rawText.match(/https?:\/\/github\.com\/[^\s)]+\/pull\/\d+/i)?.[0];
-	const blockingFromDecision = parseYesNo(
-		decision.blocking ?? "",
-		[/\byes\b/i, /\btrue\b/i],
-		[/\bno\b/i, /\bfalse\b/i],
-		findings.some((f) => f.severity === "P0" || f.severity === "P1"),
-	);
+function parseWorkflowBugPayload(args: Record<string, unknown>): WorkflowBugPayload {
 	return {
-		approved: approved && !blockingFromDecision,
-		blockingFindings: findings,
-		fixInstructions: extractSection(rawText, "Fix Instructions") || rawText.trim(),
-		codexSessionId: decision.codex_session_id || decision.review_session_id,
-		branchName: decision.branch || decision.branch_name || branchName,
-		commitShas: commitShas.length > 0 ? commitShas : undefined,
-		prUrl: decision.pr_url || prUrl,
-		prFailureReason: decision.pr_failure_reason || extractSection(rawText, "PR Failure Reason") || undefined,
+		summary: String(args.summary ?? ""),
+		details: String(args.details ?? ""),
+		terminate: Boolean(args.terminate),
 	};
-}
-
-function normalizeValidationOutput(
-	rawText: string,
-	validationJson: Record<string, unknown> | undefined,
-): {
-	passed: boolean;
-	issues: string[];
-	remediation: string;
-} {
-	if (validationJson) {
-		return {
-			passed: Boolean(validationJson.passed),
-			issues: Array.isArray(validationJson.issues) ? validationJson.issues.map((x) => String(x)) : [],
-			remediation: String(validationJson.remediation ?? ""),
-		};
-	}
-	const decision = parseDecisionBlock(rawText);
-	return {
-		passed: parseYesNo(
-			decision.status ?? rawText,
-			[/\bpassed\b/i, /\bvalidated\b/i, /\bapproved\b/i],
-			[/\bfailed\b/i, /\bnot passed\b/i, /\bneeds_changes\b/i],
-			false,
-		),
-		issues: extractBullets(extractSection(rawText, "Issues")),
-		remediation: extractSection(rawText, "Remediation") || rawText.trim(),
-	};
-}
-
-function renderSpecMarkdown(
-	task: TaskState,
-	specData: {
-		goal: string;
-		constraints: string[];
-		acceptanceCriteria: string[];
-		complexitySignals: string[];
-		implementationNotes: string[];
-		implementationPhases: string[];
-		phaseCompletionChecks: string[];
-	},
-): string {
-	const phases =
-		specData.implementationPhases.length > 0
-			? specData.implementationPhases
-			: ["Phase 1: Foundation", "Phase 2: Implementation", "Phase 3: Verification and Handoff"];
-	const checks =
-		specData.phaseCompletionChecks.length > 0
-			? specData.phaseCompletionChecks
-			: [
-					"Phase 1 artifacts created and wired (types/modules/hooks/interfaces).",
-					"Phase 2 feature behavior implemented and integrated in target surfaces.",
-					"Phase 3 tests pass and manual verification evidence is captured.",
-				];
-	return [
-		`# Spec: ${task.title}`,
-		"",
-		`- Task ID: ${task.id}`,
-		`- Created: ${task.createdAt}`,
-		`- Updated: ${task.updatedAt}`,
-		`- Repository Root: ${task.repoPath}`,
-		`- Worktree Path: ${task.worktreePath ?? "n/a"}`,
-		`- Worktree Branch: ${task.worktreeBranch ?? "n/a"}`,
-		"",
-		"## Goal",
-		specData.goal,
-		"",
-		"## Constraints",
-		...specData.constraints.map((x) => `- ${x}`),
-		"",
-		"## Acceptance Criteria",
-		...specData.acceptanceCriteria.map((x) => `- ${x}`),
-		"",
-		"## Complexity Signals",
-		...specData.complexitySignals.map((x) => `- ${x}`),
-		"",
-		"## Implementation Phases",
-		...phases.map((x, i) => `${i + 1}. ${x}`),
-		"",
-		"## Phase Completion Checks",
-		...checks.map((x) => `- [ ] ${x}`),
-		"",
-		"## Implementation Notes",
-		...specData.implementationNotes.map((x) => `- ${x}`),
-		"",
-		"## Original Task",
-		task.originalTask,
-		"",
-	].join("\n");
-}
-
-function heuristicRoute(taskText: string, specSignals: string[]): "codex-impl" | "amp-impl" {
-	let score = 0;
-	const lower = taskText.toLowerCase();
-	const complexKeywords = [
-		"complex",
-		"architecture",
-		"refactor",
-		"migration",
-		"multi",
-		"integration",
-		"distributed",
-		"large",
-		"cross-cutting",
-	];
-	for (const kw of complexKeywords) {
-		if (lower.includes(kw)) score += 1;
-	}
-	score += Math.min(3, specSignals.length);
-	if (taskText.length > 700) score += 1;
-	return score >= 4 ? "amp-impl" : "codex-impl";
-}
-
-function summarizeState(state: TaskState): string {
-	const topFinding = state.blockingFindings[0];
-	return [
-		`Task ${state.id}: ${state.title}`,
-		`Status: ${state.status}`,
-		`Stage: ${state.stage}`,
-		`Repo: ${state.repoPath}`,
-		state.worktreePath ? `Worktree: ${state.worktreePath}` : undefined,
-		state.worktreeBranch ? `Worktree branch: ${state.worktreeBranch}` : undefined,
-		`Review loops: ${state.reviewLoops}/${state.maxReviewLoops}`,
-		`Validation loops: ${state.validationLoops}/${state.maxValidationLoops}`,
-		state.routedAgent ? `Implementation agent: ${state.routedAgent}` : undefined,
-		state.codexReviewSessionId ? `Codex review session: ${state.codexReviewSessionId}` : undefined,
-		state.lastBranchName ? `Branch: ${state.lastBranchName}` : undefined,
-		state.lastPrUrl ? `PR: ${state.lastPrUrl}` : undefined,
-		state.lastPrFailureReason ? `PR status: ${state.lastPrFailureReason}` : undefined,
-		topFinding ? `Top blocking finding: [${topFinding.severity}] ${topFinding.title}` : undefined,
-		state.validationIssues[0] ? `Top validation issue: ${state.validationIssues[0]}` : undefined,
-	].filter(Boolean).join("\n");
-}
-
-async function runSubagent(
-	agent: AgentConfig,
-	taskPrompt: string,
-	runCwd: string,
-	repoRootPath: string,
-	worktreePath: string,
-	worktreeBranch: string | undefined,
-	onStreamEvent?: (kind: string, text: string) => void,
-): Promise<SubagentRun> {
-	const args = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
-
-	let promptFile: string | undefined;
-	try {
-		if (agent.systemPrompt.trim()) {
-			const tempDir = path.join(repoRootPath, ".pi", "tmp");
-			ensureDir(tempDir);
-			promptFile = path.join(tempDir, `orchestrator-prompt-${safeFilename(agent.name)}-${Date.now()}.md`);
-			const runtimeGuardrails = [
-				"",
-				"Runtime guardrails:",
-				`- Repository root path: ${repoRootPath}`,
-				`- Active worktree path: ${worktreePath}`,
-				`- Active git branch: ${worktreeBranch ?? "(unknown)"}`,
-				"- Always work in the active worktree path above.",
-				"- Do not clone the repository again.",
-				"- Do not create nested duplicate repos.",
-			].join("\n");
-			fs.writeFileSync(promptFile, `${agent.systemPrompt}\n${runtimeGuardrails}\n`, "utf-8");
-			args.push("--append-system-prompt", promptFile);
-		}
-		args.push(`Task: ${taskPrompt}`);
-
-		const assistantChunks: string[] = [];
-		let finalAssistantText = "";
-		let stderr = "";
-		let eventCount = 0;
-		let toolEventCount = 0;
-		let deltaCount = 0;
-		let pendingDelta = "";
-		let stdoutBuffer = "";
-		const flushDelta = (): void => {
-			const text = pendingDelta.trim();
-			if (!text) return;
-			pendingDelta = "";
-			onStreamEvent?.("assistant_delta", text);
-		};
-		const parseLine = (line: string): void => {
-			if (!line.trim()) return;
-			try {
-				const event = JSON.parse(line) as Record<string, unknown>;
-				const eventType = String(event.type ?? "");
-				if (eventType && eventType !== "session") eventCount += 1;
-				if (eventType === "message_update") {
-					const assistantMessageEvent = event.assistantMessageEvent as Record<string, unknown> | undefined;
-					if (assistantMessageEvent?.type === "text_delta") {
-						const delta = String(assistantMessageEvent.delta ?? "");
-						if (delta) {
-							deltaCount += 1;
-							pendingDelta += delta;
-							if (pendingDelta.length >= 160 || pendingDelta.includes("\n")) {
-								flushDelta();
-							}
-						}
-					}
-					return;
-				}
-				if (eventType === "tool_execution_start") {
-					toolEventCount += 1;
-					onStreamEvent?.(
-						"tool_start",
-						`start ${String(event.toolName ?? "tool")} ${JSON.stringify(event.args ?? {})}`.slice(0, 320),
-					);
-					return;
-				}
-				if (eventType === "tool_execution_end") {
-					toolEventCount += 1;
-					const resultPreview = JSON.stringify(event.result ?? "").slice(0, 220);
-					onStreamEvent?.(
-						"tool_end",
-						`end ${String(event.toolName ?? "tool")} error=${Boolean(event.isError)} result=${resultPreview}`,
-					);
-					return;
-				}
-				if (eventType === "auto_retry_start") {
-					onStreamEvent?.(
-						"retry",
-						`auto retry ${String(event.attempt ?? "?")}/${String(event.maxAttempts ?? "?")} delay=${String(event.delayMs ?? "?")}ms`,
-					);
-					return;
-				}
-				if (eventType === "message_end") {
-					const msg = event.message as Record<string, unknown> | undefined;
-					if (!msg || msg.role !== "assistant") return;
-					const content = msg.content as Array<Record<string, unknown>> | undefined;
-					if (!content) return;
-					const text = content
-						.filter((c) => c.type === "text")
-						.map((c) => String(c.text ?? ""))
-						.join("\n")
-						.trim();
-					if (text) {
-						assistantChunks.push(text);
-						finalAssistantText = text;
-						onStreamEvent?.("assistant_message_end", text.slice(0, 320));
-					}
-				}
-			} catch {
-				// ignore parse errors and non-JSON lines
-			}
-		};
-
-		const started = Date.now();
-		const result = await new Promise<{ code: number; stderr: string }>((resolve) => {
-			const timeoutMs = getSubagentTimeoutMs();
-			const child = spawn("pi", args, { cwd: runCwd, stdio: ["ignore", "pipe", "pipe"] });
-			let done = false;
-			const complete = (code: number, err: string): void => {
-				if (done) return;
-				done = true;
-				resolve({ code, stderr: err });
-			};
-			const timeout = setTimeout(() => {
-				onStreamEvent?.("timeout", `subagent exceeded timeout after ${Math.floor(timeoutMs / 1000)}s`);
-				child.kill("SIGTERM");
-				setTimeout(() => child.kill("SIGKILL"), 5_000);
-			}, timeoutMs);
-			child.stdout.on("data", (chunk) => {
-				stdoutBuffer += chunk.toString("utf-8");
-				let idx = stdoutBuffer.indexOf("\n");
-				while (idx !== -1) {
-					const line = stdoutBuffer.slice(0, idx).trimEnd();
-					stdoutBuffer = stdoutBuffer.slice(idx + 1);
-					parseLine(line);
-					idx = stdoutBuffer.indexOf("\n");
-				}
-			});
-			child.stderr.on("data", (chunk) => {
-				stderr += chunk.toString("utf-8");
-			});
-			child.on("error", (err) => {
-				clearTimeout(timeout);
-				complete(1, `${stderr}\n${err.message}`.trim());
-			});
-			child.on("close", (code) => {
-				clearTimeout(timeout);
-				if (stdoutBuffer.trim()) parseLine(stdoutBuffer.trim());
-				flushDelta();
-				complete(code ?? 1, stderr.trim());
-			});
-		});
-
-		return {
-			ok: result.code === 0,
-			exitCode: result.code,
-			stderr: result.stderr || stderr.trim(),
-			finalAssistantText,
-			fullAssistantText: assistantChunks.join("\n\n"),
-			eventCount,
-			toolEventCount,
-			deltaCount,
-			durationMs: Date.now() - started,
-		};
-	} finally {
-		if (promptFile && fs.existsSync(promptFile)) {
-			fs.unlinkSync(promptFile);
-		}
-	}
-}
-
-async function ensureTaskWorktree(pi: ExtensionAPI, state: TaskState): Promise<void> {
-	const worktreesRoot = path.join(state.repoPath, ".pi", "worktrees");
-	ensureDir(worktreesRoot);
-
-	if (!state.worktreePath) {
-		state.worktreePath = path.join(worktreesRoot, safeFilename(state.id));
-	}
-	if (!state.worktreeBranch) {
-		state.worktreeBranch = `pi/${safeFilename(state.id).slice(0, 52)}`;
-	}
-
-	const existingGit = path.join(state.worktreePath, ".git");
-	if (!fs.existsSync(existingGit)) {
-		ensureDir(path.dirname(state.worktreePath));
-		// Create isolated branch/worktree for this task.
-		const addResult = await pi.exec(
-			"git",
-			["-C", state.repoPath, "worktree", "add", "-b", state.worktreeBranch, state.worktreePath, "HEAD"],
-			{ timeout: 120_000 },
-		);
-		if (addResult.code !== 0) {
-			// Fallback for resumed tasks/branches that may already exist.
-			const retry = await pi.exec(
-				"git",
-				["-C", state.repoPath, "worktree", "add", state.worktreePath, state.worktreeBranch],
-				{ timeout: 120_000 },
-			);
-			if (retry.code !== 0) {
-				throw new Error(`Failed to create worktree: ${addResult.stderr || retry.stderr || "unknown git error"}`);
-			}
-		}
-	}
-
-	const branchResult = await pi.exec("git", ["-C", state.worktreePath, "branch", "--show-current"], { timeout: 10_000 });
-	if (branchResult.code === 0 && branchResult.stdout.trim()) {
-		state.worktreeBranch = branchResult.stdout.trim();
-	}
-}
-
-function appendHistory(state: TaskState, stage: TaskStage, note: string): void {
-	state.stage = stage;
-	state.updatedAt = nowIso();
-	state.history.push({ at: state.updatedAt, stage, note });
-}
-
-function getLiveLogPath(cwd: string, state: TaskState): string {
-	if (state.liveLogPath) return state.liveLogPath;
-	const reportDir = path.join(cwd, ".pi", "reports");
-	ensureDir(reportDir);
-	state.liveLogPath = path.join(reportDir, `${safeFilename(state.id)}.live.log`);
-	return state.liveLogPath;
-}
-
-function getTraceDir(cwd: string, state: TaskState): string {
-	if (state.traceDir) return state.traceDir;
-	const reportDir = path.join(cwd, ".pi", "reports");
-	ensureDir(reportDir);
-	state.traceDir = path.join(reportDir, `${safeFilename(state.id)}.trace`);
-	ensureDir(state.traceDir);
-	return state.traceDir;
 }
 
 function previewFile(filePath: string | undefined, maxLines: number, maxCharsPerLine = 140): string[] {
@@ -856,15 +441,10 @@ function parseStreamEventsFromLiveLog(
 ): Array<{ at: string; agent: string; purpose: string; kind: string; text: string }> {
 	if (!fs.existsSync(liveLogPath)) return [];
 	try {
-		const lines = fs
-			.readFileSync(liveLogPath, "utf-8")
-			.split("\n")
-			.filter(Boolean);
+		const lines = fs.readFileSync(liveLogPath, "utf-8").split("\n").filter(Boolean);
 		const out: Array<{ at: string; agent: string; purpose: string; kind: string; text: string }> = [];
 		for (const line of lines) {
-			const match = line.match(
-				/^(\d{4}-\d{2}-\d{2}T[^ ]+)\s+\[stream:([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)\]\s+([\s\S]+)$/,
-			);
+			const match = line.match(/^(\d{4}-\d{2}-\d{2}T[^ ]+)\s+\[stream:([a-zA-Z0-9._-]+):([a-zA-Z0-9._-]+)\]\s+([\s\S]+)$/);
 			if (!match) continue;
 			out.push({
 				at: match[1],
@@ -880,69 +460,114 @@ function parseStreamEventsFromLiveLog(
 	}
 }
 
-type WidgetMode = "compact" | "spec" | "prompt" | "result" | "history" | "stream";
-let widgetMode: WidgetMode = "compact";
-const widgetModes: WidgetMode[] = ["compact", "spec", "prompt", "result", "history", "stream"];
-
-function getWidgetModePath(repoPath: string): string {
-	const reportDir = path.join(repoPath, ".pi", "reports");
+function getLiveLogPath(cwd: string, state: TaskState): string {
+	if (state.liveLogPath) return state.liveLogPath;
+	const reportDir = path.join(cwd, ".pi", "reports");
 	ensureDir(reportDir);
-	return path.join(reportDir, "orchestrator-widget-mode.txt");
+	state.liveLogPath = path.join(reportDir, `${safeFilename(state.id)}.live.log`);
+	return state.liveLogPath;
 }
 
-function parseWidgetMode(raw: string | undefined): WidgetMode | undefined {
-	if (!raw) return undefined;
-	const mode = raw.trim().toLowerCase() as WidgetMode;
-	return widgetModes.includes(mode) ? mode : undefined;
+function getLiveStatePath(cwd: string, state: TaskState): string {
+	if (state.liveStatePath) return state.liveStatePath;
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	state.liveStatePath = path.join(reportDir, `${safeFilename(state.id)}.state.json`);
+	return state.liveStatePath;
 }
 
-function readWidgetMode(repoPath: string, worktreePath?: string, fallbackCwd?: string): WidgetMode {
-	const envMode = parseWidgetMode(process.env.PI_ORCHESTRATOR_WIDGET_MODE);
-	if (envMode) return envMode;
-	const candidateBases = [repoPath, worktreePath, fallbackCwd].filter(
-		(x): x is string => typeof x === "string" && x.length > 0,
-	);
-	for (const base of candidateBases) {
-		const modePath = getWidgetModePath(base);
-		try {
-			const raw = fs.readFileSync(modePath, "utf-8");
-			const parsed = parseWidgetMode(raw);
-			if (parsed) return parsed;
-		} catch {
-			// ignore missing/invalid mode file
-		}
+function getTraceDir(cwd: string, state: TaskState): string {
+	if (state.traceDir) return state.traceDir;
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	state.traceDir = path.join(reportDir, `${safeFilename(state.id)}.trace`);
+	ensureDir(state.traceDir);
+	return state.traceDir;
+}
+
+function getEventLogPath(cwd: string, state: TaskState): string {
+	if (state.eventLogPath) return state.eventLogPath;
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	state.eventLogPath = path.join(reportDir, `${safeFilename(state.id)}.events.jsonl`);
+	return state.eventLogPath;
+}
+
+function getProgressPath(cwd: string, state: TaskState): string {
+	if (state.progressPath) return state.progressPath;
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	state.progressPath = path.join(reportDir, `${safeFilename(state.id)}.progress.md`);
+	if (!fs.existsSync(state.progressPath)) {
+		fs.writeFileSync(state.progressPath, "# Progress\n\n", "utf-8");
 	}
-	return widgetMode;
+	return state.progressPath;
 }
 
-function writeWidgetMode(mode: WidgetMode, repoPaths: string[]): void {
-	widgetMode = mode;
-	process.env.PI_ORCHESTRATOR_WIDGET_MODE = mode;
-	for (const repoPath of repoPaths) {
-		const modePath = getWidgetModePath(repoPath);
-		fs.writeFileSync(modePath, `${mode}\n`, "utf-8");
-	}
+function readProgress(state: TaskState): string {
+	const progressPath = getProgressPath(state.repoPath, state);
+	return fs.existsSync(progressPath) ? fs.readFileSync(progressPath, "utf-8") : "# Progress\n\n";
 }
 
-function shortenMiddle(input: string, max = 88): string {
-	if (input.length <= max) return input;
-	const keep = Math.max(8, Math.floor((max - 3) / 2));
-	return `${input.slice(0, keep)}...${input.slice(input.length - keep)}`;
+function appendProgressEntry(state: TaskState, agent: RuntimeAgent, entry: string): void {
+	const trimmed = entry.trim().replace(/\s+/g, " ");
+	if (!trimmed) return;
+	const progressPath = getProgressPath(state.repoPath, state);
+	const line = `- ${agent}: ${trimmed.slice(0, 240)}\n`;
+	fs.appendFileSync(progressPath, line, "utf-8");
 }
 
-function buildPanelPreview(
-	title: string,
-	filePath: string | undefined,
-	lines: number,
-	th: ExtensionContext["ui"]["theme"],
-): string[] {
-	const out: string[] = [];
-	out.push(th.fg("muted", `${title}:`));
-	out.push(`  ${th.fg("accent", filePath ? shortenMiddle(filePath, 104) : "(none)")}`);
-	if (filePath) {
-		for (const line of previewFile(filePath, lines, 110)) out.push(`  ${line}`);
-	}
-	return out;
+function getPromptDraftPath(cwd: string, state: TaskState): string {
+	if (state.promptDraftPath) return state.promptDraftPath;
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	state.promptDraftPath = path.join(reportDir, `${safeFilename(state.id)}.prompt-draft.md`);
+	return state.promptDraftPath;
+}
+
+function writePromptDraft(state: TaskState, content: string): string {
+	const promptPath = getPromptDraftPath(state.repoPath, state);
+	fs.writeFileSync(promptPath, content, "utf-8");
+	return promptPath;
+}
+
+function readPromptDraft(state: TaskState): string {
+	const promptPath = getPromptDraftPath(state.repoPath, state);
+	return fs.existsSync(promptPath) ? fs.readFileSync(promptPath, "utf-8") : "";
+}
+
+function getStopRequestPath(cwd: string, state: TaskState): string {
+	const reportDir = path.join(cwd, ".pi", "reports");
+	ensureDir(reportDir);
+	return path.join(reportDir, `${safeFilename(state.id)}.stop`);
+}
+
+function hasStopRequest(cwd: string, state: TaskState): boolean {
+	return fs.existsSync(getStopRequestPath(cwd, state));
+}
+
+function writeStopRequest(cwd: string, state: TaskState, reason: string): void {
+	fs.writeFileSync(getStopRequestPath(cwd, state), `${reason}\n`, "utf-8");
+}
+
+function clearStopRequest(cwd: string, state: TaskState): void {
+	const stopPath = getStopRequestPath(cwd, state);
+	if (fs.existsSync(stopPath)) fs.unlinkSync(stopPath);
+}
+
+function appendHistory(state: TaskState, stage: TaskStage, note: string): void {
+	state.stage = stage;
+	state.updatedAt = nowIso();
+	state.history.push({ at: state.updatedAt, stage, note });
+}
+
+function persistTask(pi: ExtensionAPI, state: TaskState): void {
+	pi.appendEntry("pi-orchestrator-task", state);
+	writeJsonAtomic(getLiveStatePath(state.repoPath, state), state);
+}
+
+function recordEvent(state: TaskState, event: EventRecord): void {
+	appendJsonl(getEventLogPath(state.repoPath, state), event);
 }
 
 function refreshLiveUi(ctx: ExtensionContext, state: TaskState): void {
@@ -954,115 +579,242 @@ function refreshLiveUi(ctx: ExtensionContext, state: TaskState): void {
 		state.streamEvents = parseStreamEventsFromLiveLog(liveLogPath, 80);
 	}
 	const latest = state.history[state.history.length - 1];
-	const statusNote = latest ? ` | ${latest.note}` : "";
-	const statusColor =
-		state.status === "completed" ? "success" : state.status === "failed" ? "error" : "accent";
-	ctx.ui.setStatus(
-		"pi-orchestrator",
-		`${th.fg(statusColor, `Task ${state.id}`)} ${th.fg("muted", `${state.status} ${state.stage}${statusNote}`)}`,
-	);
-
-	const header: string[] = [
+	const statusColor = state.status === "completed" ? "success" : state.status === "failed" ? "error" : "accent";
+	const header = [
 		th.fg("accent", "Pi Orchestrator"),
 		`${th.fg("muted", "Status")} ${th.fg(statusColor, state.status)}  ${th.fg("muted", "Stage")} ${th.fg("warning", state.stage)}`,
+		`${th.fg("muted", "Agent")} ${th.fg("success", state.currentAgent ?? state.activeAgentName ?? "idle")}`,
 		`${th.fg("muted", "Loops")} R ${state.reviewLoops}/${state.maxReviewLoops} | V ${state.validationLoops}/${state.maxValidationLoops}`,
-		`${th.fg("muted", "Agent")} ${state.activeAgentName ? th.fg("success", state.activeAgentName) : th.fg("dim", "idle")} ${th.fg("dim", state.activeAgentPurpose ? `(${state.activeAgentPurpose})` : "")}`,
-		`${th.fg("muted", "View")} ${th.fg("accent", currentWidgetMode)} ${th.fg("dim", "(switch: /orchestrate-widget <compact|spec|prompt|result|history|stream>)")}`,
+		`${th.fg("muted", "Handoffs")} ${state.handoffCount}`,
 	];
-
 	const body: string[] = [];
-	if (currentWidgetMode === "compact") {
-		const hist = state.history.slice(-2).map((h) => `${th.fg("dim", h.at.slice(11, 19))} ${th.fg("warning", `[${h.stage}]`)} ${h.note}`);
+	if (currentWidgetMode === "handoff") {
+		const handoff = state.lastHandoff;
 		body.push(
-			`${th.fg("muted", "Spec")} ${th.fg("accent", shortenMiddle(state.specPath ?? "(none)", 92))}`,
-			`${th.fg("muted", "Prompt")} ${th.fg("accent", shortenMiddle(state.lastPromptPath ?? "(none)", 90))}`,
-			`${th.fg("muted", "Result")} ${th.fg("accent", shortenMiddle(state.lastResultPath ?? "(none)", 90))}`,
-			`${th.fg("muted", "Command")} ${th.fg("accent", shortenMiddle(state.lastSubagentCommand ?? "(none)", 90))}`,
-			`${th.fg("muted", "Stream")} ${th.fg("accent", shortenMiddle(state.lastStreamEvent ?? "(none)", 90))}`,
-			th.fg("muted", "Recent"),
-			...hist,
+			th.fg("muted", "Latest handoff:"),
+			`  ${handoff ? `${handoff.fromAgent} -> ${handoff.toAgent}` : "(none yet)"}`,
+			`  ${handoff?.summary ?? ""}`,
+			...(handoff?.message ? handoff.message.split("\n").slice(0, 6).map((line) => `  ${line}`) : []),
 		);
-	} else if (currentWidgetMode === "spec") {
-		body.push(...buildPanelPreview("Spec", state.specPath, 6, th));
 	} else if (currentWidgetMode === "prompt") {
 		body.push(...buildPanelPreview("Prompt", state.lastPromptPath, 6, th));
 	} else if (currentWidgetMode === "result") {
 		body.push(...buildPanelPreview("Result", state.lastResultPath, 6, th));
+	} else if (currentWidgetMode === "history") {
+		body.push(
+			th.fg("muted", "History:"),
+			...state.history.slice(-8).map((entry) => `${th.fg("dim", entry.at)} ${th.fg("warning", `[${entry.stage}]`)} ${entry.note}`),
+		);
 	} else if (currentWidgetMode === "stream") {
-		const streamLines = (state.streamEvents ?? []).slice(-8).map((e) => {
-			const t = e.at.slice(11, 19);
-			return `${th.fg("dim", t)} ${th.fg("success", `[${e.agent}]`)} ${th.fg("warning", e.kind)} ${e.text}`;
-		});
 		body.push(
 			th.fg("muted", "Agent stream:"),
-			...(streamLines.length > 0 ? streamLines : [th.fg("dim", "(no stream events yet)")]),
+			...(state.streamEvents ?? []).slice(-8).map((event) => `${th.fg("dim", event.at.slice(11, 19))} ${th.fg("success", `[${event.agent}]`)} ${th.fg("warning", event.kind)} ${event.text}`),
 		);
 	} else {
 		body.push(
-			th.fg("muted", "History:"),
-			...state.history.slice(-8).map((h) => `${th.fg("dim", h.at)} ${th.fg("warning", `[${h.stage}]`)} ${h.note}`),
+			`${th.fg("muted", "Current")} ${state.currentAgent ?? "idle"}`,
+			`${th.fg("muted", "Last note")} ${latest?.note ?? "(none)"}`,
+			`${th.fg("muted", "Failure")} ${state.failureKind ? `${state.failureKind}: ${state.failureDetails ?? ""}` : "none"}`,
+			`${th.fg("muted", "Last handoff")} ${state.lastHandoff ? `${state.lastHandoff.fromAgent} -> ${state.lastHandoff.toAgent}` : "(none)"}`,
 		);
 	}
-
+	ctx.ui.setStatus(
+		"pi-orchestrator",
+		`${th.fg(statusColor, `Task ${state.id}`)} ${th.fg("muted", `${state.status} ${state.stage}${latest ? ` | ${latest.note}` : ""}`)}`,
+	);
 	ctx.ui.setWidget("pi-orchestrator-progress", [...header, "", ...body]);
-	const quickActions = [th.fg("muted", `Quick: /orchestrate-log ${state.id} | /orchestrate-trace ${state.id} | /orchestrate-tail ${state.id}`)];
-	ctx.ui.setWidget("pi-orchestrator-actions", quickActions, { placement: "belowEditor" });
+	ctx.ui.setWidget("pi-orchestrator-actions", [th.fg("muted", `Quick: /orchestrate-log ${state.id} | /orchestrate-trace ${state.id} | /orchestrate-tail ${state.id}`)], {
+		placement: "belowEditor",
+	});
 }
 
-function recordProgress(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	state: TaskState,
-	stage: TaskStage,
-	note: string,
-): void {
+function buildPanelPreview(
+	title: string,
+	filePath: string | undefined,
+	lines: number,
+	th: ExtensionContext["ui"]["theme"],
+): string[] {
+	const out: string[] = [];
+	out.push(th.fg("muted", `${title}:`));
+	out.push(`  ${th.fg("accent", filePath ?? "(none)")}`);
+	if (filePath) {
+		for (const line of previewFile(filePath, lines, 110)) out.push(`  ${line}`);
+	}
+	return out;
+}
+
+function recordProgress(pi: ExtensionAPI, ctx: ExtensionContext, state: TaskState, stage: TaskStage, note: string): void {
 	appendHistory(state, stage, note);
 	persistTask(pi, state);
-	const liveLogPath = getLiveLogPath(state.repoPath, state);
-	fs.appendFileSync(liveLogPath, `${state.updatedAt} [${stage}] ${note}\n`, "utf-8");
+	fs.appendFileSync(getLiveLogPath(state.repoPath, state), `${state.updatedAt} [${stage}] ${note}\n`, "utf-8");
 	refreshLiveUi(ctx, state);
 }
 
-function persistTask(pi: ExtensionAPI, state: TaskState): void {
-	pi.appendEntry("pi-orchestrator-task", state);
+function parseWidgetMode(raw: string | undefined): WidgetMode | undefined {
+	if (!raw) return undefined;
+	const mode = raw.trim().toLowerCase() as WidgetMode;
+	return WIDGET_MODES.includes(mode) ? mode : undefined;
 }
 
-function loadPersistedTasks(ctx: ExtensionContext): Map<string, TaskState> {
-	const entries = ctx.sessionManager.getEntries();
-	const tasks = new Map<string, TaskState>();
-	for (const entry of entries) {
-		const e = entry as { type?: string; customType?: string; data?: TaskState };
-		if (e.type !== "custom" || e.customType !== "pi-orchestrator-task" || !e.data?.id) continue;
-		tasks.set(e.data.id, {
-			...e.data,
-			repoPath: e.data.repoPath ?? ctx.cwd,
-			maxReviewLoops: e.data.maxReviewLoops ?? 3,
-			maxValidationLoops: e.data.maxValidationLoops ?? 3,
-			widgetMode:
-				e.data.widgetMode ??
-				readWidgetMode(e.data.repoPath ?? ctx.cwd, e.data.worktreePath, ctx.cwd),
-		});
-	}
-	return tasks;
-}
-
-function loadTaskById(ctx: ExtensionContext, taskId: string): TaskState | undefined {
-	return loadPersistedTasks(ctx).get(taskId);
-}
-
-function saveFinalArtifacts(cwd: string, state: TaskState, reportMarkdown: string): void {
-	const reportDir = path.join(cwd, ".pi", "reports");
+function getWidgetModePath(repoPath: string): string {
+	const reportDir = path.join(repoPath, ".pi", "reports");
 	ensureDir(reportDir);
-	const jsonPath = path.join(reportDir, `${safeFilename(state.id)}.json`);
-	const mdPath = path.join(reportDir, `${safeFilename(state.id)}.md`);
-	fs.writeFileSync(jsonPath, JSON.stringify(state, null, 2), "utf-8");
-	fs.writeFileSync(mdPath, reportMarkdown, "utf-8");
-	state.reportJsonPath = jsonPath;
-	state.reportMarkdownPath = mdPath;
+	return path.join(reportDir, "orchestrator-widget-mode.txt");
 }
 
-function buildReportMarkdown(state: TaskState, reporterOutput: string): string {
-	const lines = [
+function readWidgetMode(repoPath: string, worktreePath?: string, fallbackCwd?: string): WidgetMode {
+	const envMode = parseWidgetMode(process.env.PI_ORCHESTRATOR_WIDGET_MODE);
+	if (envMode) return envMode;
+	for (const base of [repoPath, worktreePath, fallbackCwd].filter((value): value is string => Boolean(value))) {
+		try {
+			const raw = fs.readFileSync(getWidgetModePath(base), "utf-8");
+			const parsed = parseWidgetMode(raw);
+			if (parsed) return parsed;
+		} catch {
+			// ignore
+		}
+	}
+	return "compact";
+}
+
+function writeWidgetMode(mode: WidgetMode, repoPaths: string[]): void {
+	process.env.PI_ORCHESTRATOR_WIDGET_MODE = mode;
+	for (const repoPath of repoPaths) {
+		fs.writeFileSync(getWidgetModePath(repoPath), `${mode}\n`, "utf-8");
+	}
+}
+
+async function ensureTaskWorktree(pi: ExtensionAPI, state: TaskState): Promise<void> {
+	const worktreesRoot = path.join(state.repoPath, ".pi", "worktrees");
+	ensureDir(worktreesRoot);
+	if (!state.worktreePath) state.worktreePath = path.join(worktreesRoot, safeFilename(state.id));
+	if (!state.worktreeBranch) state.worktreeBranch = `pi/${safeFilename(state.id).slice(0, 52)}`;
+	const existingGit = path.join(state.worktreePath, ".git");
+	if (!fs.existsSync(existingGit)) {
+		ensureDir(path.dirname(state.worktreePath));
+		const addResult = await pi.exec("git", ["-C", state.repoPath, "worktree", "add", "-b", state.worktreeBranch, state.worktreePath, "HEAD"], {
+			timeout: 120_000,
+		});
+		if (addResult.code !== 0) {
+			const retry = await pi.exec("git", ["-C", state.repoPath, "worktree", "add", state.worktreePath, state.worktreeBranch], {
+				timeout: 120_000,
+			});
+			if (retry.code !== 0) {
+				throw new Error(`Failed to create worktree: ${addResult.stderr || retry.stderr || "unknown git error"}`);
+			}
+		}
+	}
+	const branchResult = await pi.exec("git", ["-C", state.worktreePath, "branch", "--show-current"], { timeout: 10_000 });
+	if (branchResult.code === 0 && branchResult.stdout.trim()) {
+		state.worktreeBranch = branchResult.stdout.trim();
+	}
+}
+
+function validateToolSignal(fromAgent: RuntimeAgent, signal: ToolSignal): string | undefined {
+	if (signal.kind === "handoff") {
+		const { toAgent, message, summary } = signal.payload;
+		if (!allowedTargetsForAgent(fromAgent).includes(toAgent)) {
+			return `Invalid handoff target "${toAgent}" from ${fromAgent}`;
+		}
+		if (!message.trim()) return "Handoff message is required";
+		if (!summary.trim()) return "Handoff summary is required";
+		return undefined;
+	}
+	if (signal.kind === "workflow_bug") {
+		if (!signal.payload.summary.trim()) return "Workflow bug summary is required";
+		if (!signal.payload.details.trim()) return "Workflow bug details are required";
+		return undefined;
+	}
+	const { outcome, summary, report } = signal.payload;
+	if (fromAgent !== "reviewer" && fromAgent !== "validator" && fromAgent !== "reporter") {
+		return `Agent ${fromAgent} cannot finish the workflow`;
+	}
+	if (outcome !== "completed" && outcome !== "failed") return `Invalid finish outcome "${outcome}"`;
+	if (!summary.trim()) return "Finish summary is required";
+	if (!report.trim()) return "Finish report is required";
+	if (fromAgent === "reviewer" && outcome === "completed") {
+		return `${fromAgent} cannot complete the workflow directly`;
+	}
+	return undefined;
+}
+
+function resolveToolSignal(
+	fromAgent: RuntimeAgent,
+	signals: ToolSignal[],
+): { signal?: ToolSignal; warning?: string; error?: string } {
+	if (signals.length === 0) {
+		return { error: `Agent ${fromAgent} exited without handoff or finish` };
+	}
+	const validSignals: ToolSignal[] = [];
+	for (const signal of signals) {
+		const validationError = validateToolSignal(fromAgent, signal);
+		if (!validationError) validSignals.push(signal);
+	}
+	if (validSignals.length === 0) {
+		return { error: `Agent ${fromAgent} emitted only invalid terminal tool signals` };
+	}
+	const preferredKind = fromAgent === "reporter" ? "finish" : "handoff";
+	const preferredSignal = validSignals.find((signal) => signal.kind === preferredKind);
+	const signal = preferredSignal ?? validSignals[0];
+	if (validSignals.length > 1 || signals.length > 1) {
+		return {
+			signal,
+			warning: `Agent ${fromAgent} emitted multiple terminal tool signals; using ${signal.kind} and ignoring the rest`,
+		};
+	}
+	return { signal };
+}
+
+function applyArtifactsToState(state: TaskState, artifacts: ArtifactBag | undefined): void {
+	if (!artifacts) return;
+	state.lastArtifacts = artifacts;
+	if (artifacts.branch) {
+		state.lastBranchName = String(artifacts.branch);
+	}
+	if (Array.isArray(artifacts.commits)) {
+		state.lastCommitShas = artifacts.commits.map((value) => String(value));
+	}
+	if ("pr_url" in artifacts) {
+		state.lastPrUrl = artifacts.pr_url ? String(artifacts.pr_url) : undefined;
+	}
+	if (Array.isArray(artifacts.findings)) {
+		state.blockingFindings = artifacts.findings;
+	}
+	if (Array.isArray(artifacts.issues)) {
+		state.validationIssues = artifacts.issues.map((issue) => String(issue));
+	}
+	if (Array.isArray(artifacts.verification)) {
+		state.lastVerification = artifacts.verification as VerificationItem[];
+	}
+	if (Array.isArray(artifacts.ci_checks)) {
+		state.lastCiChecks = artifacts.ci_checks as CiCheck[];
+	}
+	if ("codex_session_id" in artifacts) {
+		state.codexReviewSessionId = artifacts.codex_session_id ? String(artifacts.codex_session_id) : undefined;
+	}
+}
+
+function buildSpecMarkdown(state: TaskState, handoff: HandoffRecord): string {
+	return [
+		`# Spec: ${state.title}`,
+		"",
+		`- Task ID: ${state.id}`,
+		`- Created: ${state.createdAt}`,
+		`- Updated: ${state.updatedAt}`,
+		`- Repository Root: ${state.repoPath}`,
+		`- Worktree Path: ${state.worktreePath ?? "n/a"}`,
+		`- Worktree Branch: ${state.worktreeBranch ?? "n/a"}`,
+		`- Routed Implementation Agent: ${handoff.toAgent}`,
+		`- Summary: ${handoff.summary}`,
+		"",
+		"## Handoff Message",
+		handoff.message,
+		"",
+	].join("\n");
+}
+
+function buildReportMarkdown(state: TaskState): string {
+	return [
 		`# Pi Orchestrator Report: ${state.title}`,
 		"",
 		`- Task ID: ${state.id}`,
@@ -1071,51 +823,387 @@ function buildReportMarkdown(state: TaskState, reporterOutput: string): string {
 		`- Repository Root: ${state.repoPath}`,
 		`- Worktree Path: ${state.worktreePath ?? "n/a"}`,
 		`- Worktree Branch: ${state.worktreeBranch ?? "n/a"}`,
-		`- Routed Implementation Agent: ${state.routedAgent ?? "n/a"}`,
-		`- Codex Review Session: ${state.codexReviewSessionId ?? "n/a"}`,
+		`- Progress File: ${state.progressPath ?? "n/a"}`,
+		`- Current Agent: ${state.currentAgent ?? "n/a"}`,
 		`- Branch: ${state.lastBranchName ?? "n/a"}`,
 		`- Pull Request: ${state.lastPrUrl ?? "n/a"}`,
-		`- PR Failure Reason: ${state.lastPrFailureReason ?? "n/a"}`,
-		`- Commits: ${state.lastCommitShas && state.lastCommitShas.length > 0 ? state.lastCommitShas.join(", ") : "n/a"}`,
 		`- Review Loops: ${state.reviewLoops}/${state.maxReviewLoops}`,
 		`- Validation Loops: ${state.validationLoops}/${state.maxValidationLoops}`,
+		`- Handoffs: ${state.handoffCount}`,
 		"",
-		"## Stage History",
-		...state.history.map((h) => `- ${h.at} | ${h.stage} | ${h.note}`),
+		"## Handoffs",
+		...(state.handoffHistory.length > 0
+			? state.handoffHistory.map((handoff) => `- ${handoff.at} | ${handoff.fromAgent} -> ${handoff.toAgent} | ${handoff.summary}`)
+			: ["- None"]),
 		"",
 		"## Blocking Findings",
 		...(state.blockingFindings.length > 0
-			? state.blockingFindings.map((f) => `- [${f.severity}] ${f.title}: ${f.description}`)
+			? state.blockingFindings.map((finding) => `- [${finding.severity}] ${finding.title}: ${finding.description}`)
 			: ["- None"]),
 		"",
 		"## Validation Issues",
-		...(state.validationIssues.length > 0 ? state.validationIssues.map((x) => `- ${x}`) : ["- None"]),
+		...(state.validationIssues.length > 0 ? state.validationIssues.map((issue) => `- ${issue}`) : ["- None"]),
 		"",
-		"## Reporter Output",
-		reporterOutput.trim() || "No reporter output.",
+		"## Progress",
+		readProgress(state),
 		"",
-	];
-	return lines.join("\n");
+		"## Final Report",
+		state.finalReport?.trim() || "No final report captured.",
+		"",
+	].join("\n");
 }
 
-async function sendReportToMainAgentWebhook(state: TaskState): Promise<void> {
-	const webhook = process.env.PI_MAIN_AGENT_WEBHOOK_URL;
-	if (!webhook) return;
-	const payload = {
-		taskId: state.id,
-		title: state.title,
-		status: state.status,
-		stage: state.stage,
-		reportJsonPath: state.reportJsonPath,
-		reportMarkdownPath: state.reportMarkdownPath,
-		summary: summarizeState(state),
-	};
+function saveFinalArtifacts(state: TaskState): void {
+	const reportDir = path.join(state.repoPath, ".pi", "reports");
+	ensureDir(reportDir);
+	const jsonPath = path.join(reportDir, `${safeFilename(state.id)}.json`);
+	const mdPath = path.join(reportDir, `${safeFilename(state.id)}.md`);
+	fs.writeFileSync(jsonPath, JSON.stringify(state, null, 2), "utf-8");
+	fs.writeFileSync(mdPath, buildReportMarkdown(state), "utf-8");
+	state.reportJsonPath = jsonPath;
+	state.reportMarkdownPath = mdPath;
+}
 
-	await fetch(webhook, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(payload),
+type DispatchCodingResult = {
+	ok: boolean;
+	provider: "codex" | "amp";
+	taskKind: "spec" | "implementation" | "review" | "validation";
+	exitCode: number;
+	timedOut: boolean;
+	durationMs: number;
+	finalAssistantText: string;
+	fullAssistantText: string;
+	stderr: string;
+	sessionId?: string;
+	promptPath: string;
+	resultPath: string;
+};
+
+async function dispatchCodingRun(
+	state: TaskState,
+	agentName: RuntimeAgent,
+	provider: "codex" | "amp",
+	taskKind: "spec" | "implementation" | "review" | "validation",
+	resumeSessionId?: string,
+): Promise<DispatchCodingResult> {
+	const promptBody = readPromptDraft(state).trim();
+	if (!promptBody) {
+		throw new Error("No prompt draft available. Call write_prompt before dispatch_coding_agent.");
+	}
+	const traceDir = getTraceDir(state.repoPath, state);
+	const stem = `${Date.now()}-${safeFilename(agentName)}-${provider}-${taskKind}-dispatch`;
+	const promptPath = path.join(traceDir, `${stem}.delegated.prompt.md`);
+	const resultPath = path.join(traceDir, `${stem}.delegated.result.md`);
+	const progress = readProgress(state);
+	const fullPrompt = [
+		`Repository root path: ${state.repoPath}`,
+		`Active worktree path: ${state.worktreePath ?? state.repoPath}`,
+		`Active git branch: ${state.worktreeBranch ?? "(unknown)"}`,
+		"All edits and git actions must happen only in the active worktree path.",
+		"Do not inspect or modify sibling repos or any other checkout on disk.",
+		"",
+		"Current run progress:",
+		progress.trim(),
+		"",
+		"Task payload:",
+		promptBody,
+		"",
+	].join("\n");
+	fs.writeFileSync(promptPath, fullPrompt, "utf-8");
+	state.lastDispatchPromptPath = promptPath;
+	const started = Date.now();
+	const timeoutMs = getSubagentTimeoutMs();
+	const execArgs =
+		provider === "codex"
+			? resumeSessionId
+				? ["exec", "resume", resumeSessionId, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", "-",]
+				: ["exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json", "-"]
+			: ["--dangerously-allow-all", "-x", "--stream-json"];
+	const command = provider === "codex" ? "codex" : "amp";
+	const result = await new Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }>((resolve) => {
+		const stdin = fs.readFileSync(promptPath, "utf-8");
+		const child = spawn(command, execArgs, {
+			cwd: state.worktreePath ?? state.repoPath,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+			setTimeout(() => child.kill("SIGKILL"), 5_000);
+		}, timeoutMs);
+		child.stdin.write(stdin);
+		child.stdin.end();
+		child.stdout.on("data", (chunk) => {
+			stdout += chunk.toString("utf-8");
+		});
+		child.stderr.on("data", (chunk) => {
+			stderr += chunk.toString("utf-8");
+		});
+		child.on("close", (code) => {
+			clearTimeout(timeout);
+			resolve({ code: code ?? 1, stdout, stderr, timedOut });
+		});
+		child.on("error", (error) => {
+			clearTimeout(timeout);
+			resolve({ code: 1, stdout, stderr: `${stderr}\n${error.message}`.trim(), timedOut });
+		});
 	});
+	const output = result.stdout.trim();
+	fs.writeFileSync(resultPath, output || result.stderr || "(empty)", "utf-8");
+	state.lastDispatchResultPath = resultPath;
+	let finalAssistantText = output;
+	let sessionId: string | undefined;
+	if (provider === "codex") {
+		const chunks = output.split("\n").filter(Boolean);
+		const messages: string[] = [];
+		for (const line of chunks) {
+			try {
+				const event = JSON.parse(line) as Record<string, unknown>;
+				if (event.type === "thread.started") sessionId = String(event.thread_id ?? "");
+				if (event.type === "message_end") {
+					const msg = event.message as Record<string, unknown> | undefined;
+					const content = msg?.content as Array<Record<string, unknown>> | undefined;
+					if (content) {
+						const text = content.filter((item) => item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
+						if (text) messages.push(text);
+					}
+				}
+			} catch {
+				// ignore
+			}
+		}
+		if (messages.length > 0) finalAssistantText = messages[messages.length - 1];
+	}
+	return {
+		ok: result.code === 0 && !result.timedOut,
+		provider,
+		taskKind,
+		exitCode: result.code,
+		timedOut: result.timedOut,
+		durationMs: Date.now() - started,
+		finalAssistantText: finalAssistantText || "(empty)",
+		fullAssistantText: output || "(empty)",
+		stderr: result.stderr.trim(),
+		sessionId,
+		promptPath,
+		resultPath,
+	};
+}
+
+async function runSubagent(
+	agent: AgentConfig,
+	taskPrompt: string,
+	taskId: string,
+	repoRootPath: string,
+	worktreePath: string,
+	worktreeBranch: string | undefined,
+	stopRequestPath: string,
+	onStreamEvent?: (kind: string, text: string) => void,
+): Promise<SubagentRun> {
+	const args = ["--mode", "json", "-p", "--no-session"];
+	args.push("--extension", ORCHESTRATOR_EXTENSION_PATH);
+	if (agent.model) args.push("--model", agent.model);
+	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	let promptFile: string | undefined;
+	let timedOut = false;
+	try {
+		if (agent.systemPrompt.trim()) {
+			const tempDir = path.join(repoRootPath, ".pi", "tmp");
+			ensureDir(tempDir);
+			promptFile = path.join(tempDir, `orchestrator-prompt-${safeFilename(agent.name)}-${Date.now()}.md`);
+			const runtimeGuardrails = [
+				"",
+				"Runtime guardrails:",
+				`- Repository root path: ${repoRootPath}`,
+				`- Active worktree path: ${worktreePath}`,
+				`- Active git branch: ${worktreeBranch ?? "(unknown)"}`,
+				"- Always work in the active worktree path above.",
+				"- Do not clone the repository again.",
+				"- Do not create nested duplicate repos.",
+				"- Use progress.md as compact shared memory for the run.",
+				"- Keep progress.md entries minimal; handoff carries the detailed transfer context.",
+				"- End your run by calling either handoff or finish exactly once.",
+				"- handoff and finish are PI TOOLS, not shell commands.",
+				"- Never use bash, which, ls, find, or grep to look for handoff or finish.",
+				"- Do not say you are handing off unless you actually call the handoff tool.",
+				"- Do not say the task is complete unless you actually call the finish tool.",
+			].join("\n");
+			fs.writeFileSync(promptFile, `${agent.systemPrompt}\n${runtimeGuardrails}\n`, "utf-8");
+			args.push("--append-system-prompt", promptFile);
+		}
+		args.push(`Task: ${taskPrompt}`);
+		const assistantChunks: string[] = [];
+		const toolSignals: ToolSignal[] = [];
+		const pendingToolArgs = new Map<string, { toolName: string; args: Record<string, unknown> }>();
+		let finalAssistantText = "";
+		let stderr = "";
+		let eventCount = 0;
+		let toolEventCount = 0;
+		let deltaCount = 0;
+		let pendingDelta = "";
+		let stdoutBuffer = "";
+		let stopRequested = false;
+		const flushDelta = (): void => {
+			const text = pendingDelta.trim();
+			if (!text) return;
+			pendingDelta = "";
+			onStreamEvent?.("assistant_delta", text);
+		};
+		const parseLine = (line: string): void => {
+			if (!line.trim()) return;
+			try {
+				const event = JSON.parse(line) as Record<string, unknown>;
+				const eventType = String(event.type ?? "");
+				if (eventType && eventType !== "session") eventCount += 1;
+				if (eventType === "message_update") {
+					const assistantMessageEvent = event.assistantMessageEvent as Record<string, unknown> | undefined;
+					if (assistantMessageEvent?.type === "text_delta") {
+						const delta = String(assistantMessageEvent.delta ?? "");
+						if (delta) {
+							deltaCount += 1;
+							pendingDelta += delta;
+							if (pendingDelta.length >= 160 || pendingDelta.includes("\n")) flushDelta();
+						}
+					}
+					return;
+				}
+				if (eventType === "tool_execution_start") {
+					toolEventCount += 1;
+					const toolCallId = String(event.toolCallId ?? `${String(event.toolName ?? "tool")}:${toolEventCount}`);
+					const toolName = String(event.toolName ?? "");
+					const toolArgs = (event.args ?? {}) as Record<string, unknown>;
+					pendingToolArgs.set(toolCallId, { toolName, args: toolArgs });
+					onStreamEvent?.("tool_start", `start ${toolName} ${JSON.stringify(toolArgs)}`.slice(0, 320));
+					return;
+				}
+				if (eventType === "tool_execution_end") {
+					toolEventCount += 1;
+					const toolCallId = String(event.toolCallId ?? `${String(event.toolName ?? "tool")}:${toolEventCount}`);
+					const pending = pendingToolArgs.get(toolCallId);
+					const toolName = pending?.toolName ?? String(event.toolName ?? "");
+					onStreamEvent?.(
+						"tool_end",
+						`end ${toolName} error=${Boolean(event.isError)} result=${JSON.stringify(event.result ?? "").slice(0, 220)}`,
+					);
+					if (!event.isError && pending) {
+						if (toolName === "handoff") {
+							toolSignals.push({ kind: "handoff", payload: parseHandoffPayload(pending.args) });
+						}
+						if (toolName === "finish") {
+							toolSignals.push({ kind: "finish", payload: parseFinishPayload(pending.args) });
+						}
+						if (toolName === "report_bug_in_workflow") {
+							toolSignals.push({ kind: "workflow_bug", payload: parseWorkflowBugPayload(pending.args) });
+						}
+					}
+					pendingToolArgs.delete(toolCallId);
+					return;
+				}
+				if (eventType === "auto_retry_start") {
+					onStreamEvent?.(
+						"retry",
+						`auto retry ${String(event.attempt ?? "?")}/${String(event.maxAttempts ?? "?")} delay=${String(event.delayMs ?? "?")}ms`,
+					);
+					return;
+				}
+				if (eventType === "message_end") {
+					const msg = event.message as Record<string, unknown> | undefined;
+					if (!msg || msg.role !== "assistant") return;
+					const content = msg.content as Array<Record<string, unknown>> | undefined;
+					if (!content) return;
+					const text = content.filter((item) => item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
+					if (text) {
+						assistantChunks.push(text);
+						finalAssistantText = text;
+						onStreamEvent?.("assistant_message_end", text.slice(0, 320));
+					}
+				}
+			} catch {
+				// ignore non-JSON output
+			}
+		};
+		const started = Date.now();
+		const result = await new Promise<{ code: number; stderr: string }>((resolve) => {
+			const timeoutMs = getSubagentTimeoutMs();
+			const child = spawn("pi", args, {
+				cwd: getSubagentRuntimeCwd(),
+				stdio: ["ignore", "pipe", "pipe"],
+				env: {
+					...process.env,
+					PI_ORCHESTRATOR_TASK_ID: taskId,
+					PI_ORCHESTRATOR_ACTIVE_AGENT: agent.name,
+					PI_ORCHESTRATOR_REPO_PATH: repoRootPath,
+					PI_ORCHESTRATOR_WORKTREE_PATH: worktreePath,
+				},
+			});
+			let done = false;
+			const complete = (code: number, err: string): void => {
+				if (done) return;
+				done = true;
+				resolve({ code, stderr: err });
+			};
+			const maybeStop = (): void => {
+				if (stopRequested || !fs.existsSync(stopRequestPath)) return;
+				stopRequested = true;
+				onStreamEvent?.("stop_requested", "stop request received; terminating subagent");
+				child.kill("SIGTERM");
+				setTimeout(() => child.kill("SIGKILL"), 5_000);
+			};
+			const timeout = setTimeout(() => {
+				timedOut = true;
+				onStreamEvent?.("timeout", `subagent exceeded timeout after ${Math.floor(timeoutMs / 1000)}s`);
+				child.kill("SIGTERM");
+				setTimeout(() => child.kill("SIGKILL"), 5_000);
+			}, timeoutMs);
+			const stopPoll = setInterval(maybeStop, 1000);
+			child.stdout.on("data", (chunk) => {
+				maybeStop();
+				stdoutBuffer += chunk.toString("utf-8");
+				let idx = stdoutBuffer.indexOf("\n");
+				while (idx !== -1) {
+					const line = stdoutBuffer.slice(0, idx).trimEnd();
+					stdoutBuffer = stdoutBuffer.slice(idx + 1);
+					parseLine(line);
+					idx = stdoutBuffer.indexOf("\n");
+				}
+			});
+			child.stderr.on("data", (chunk) => {
+				maybeStop();
+				stderr += chunk.toString("utf-8");
+			});
+			child.on("error", (error) => {
+				clearTimeout(timeout);
+				clearInterval(stopPoll);
+				complete(1, `${stderr}\n${error.message}`.trim());
+			});
+			child.on("close", (code) => {
+				clearTimeout(timeout);
+				clearInterval(stopPoll);
+				if (stdoutBuffer.trim()) parseLine(stdoutBuffer.trim());
+				flushDelta();
+				complete(code ?? 1, stderr.trim());
+			});
+		});
+		return {
+			ok: result.code === 0,
+			exitCode: result.code,
+			stderr: result.stderr || stderr.trim(),
+			finalAssistantText,
+			fullAssistantText: assistantChunks.join("\n\n"),
+			eventCount,
+			toolEventCount,
+			deltaCount,
+			durationMs: Date.now() - started,
+			timedOut,
+			stopRequested,
+			toolSignals,
+		};
+	} finally {
+		if (promptFile && fs.existsSync(promptFile)) fs.unlinkSync(promptFile);
+	}
 }
 
 async function runWorkflow(
@@ -1124,21 +1212,35 @@ async function runWorkflow(
 	state: TaskState,
 	agents: Map<string, AgentConfig>,
 ): Promise<TaskState> {
-	const getAgent = (name: string): AgentConfig => {
+	const getAgent = (name: RuntimeAgent): AgentConfig => {
 		const agent = agents.get(name);
-		if (!agent) {
-			throw new Error(`Missing required agent definition "${name}" in .pi/agents`);
-		}
+		if (!agent) throw new Error(`Missing required agent definition "${name}" in .pi/agents`);
 		return agent;
 	};
-
-	const runAgent = async (agentName: string, purpose: string, prompt: string): Promise<SubagentRun> => {
+	const failTask = (kind: FailureKind, details: string, agent?: RuntimeAgent): TaskState => {
+		state.status = "failed";
+		state.stage = "failed";
+		state.failureKind = kind;
+		state.failureDetails = details;
+		recordEvent(state, { type: "failure", at: nowIso(), taskId: state.id, agent, kind, details });
+		recordProgress(pi, ctx, state, "failed", `${kind}: ${details}`);
+		saveFinalArtifacts(state);
+		persistTask(pi, state);
+		return state;
+	};
+	const runAgent = async (agentName: RuntimeAgent, purpose: string, prompt: string): Promise<SubagentRun> => {
 		const executionPath = state.worktreePath ?? state.repoPath;
+		const progressText = readProgress(state);
 		const contextualPrompt = [
 			`Execution repository path: ${executionPath}`,
 			`Repository root path: ${state.repoPath}`,
 			`Execution git branch: ${state.worktreeBranch ?? "(unknown)"}`,
-			"Do not clone this repository again. Work only in the execution repository path above.",
+			`Progress file path: ${getProgressPath(state.repoPath, state)}`,
+			`Current agent: ${agentName}`,
+			`Current stage: ${getStageForAgent(agentName)}`,
+			"",
+			"Current run progress:",
+			progressText.trim(),
 			"",
 			prompt,
 		].join("\n");
@@ -1149,31 +1251,32 @@ async function runWorkflow(
 		const promptPath = path.join(traceDir, `${stem}.prompt.md`);
 		const resultPath = path.join(traceDir, `${stem}.result.md`);
 		const metaPath = path.join(traceDir, `${stem}.meta.json`);
-
 		fs.writeFileSync(promptPath, contextualPrompt, "utf-8");
 		state.activeAgentName = agentName;
 		state.activeAgentPurpose = purpose;
+		state.currentAgent = agentName;
 		state.lastPromptPath = promptPath;
 		state.lastResultPath = undefined;
 		const selectedAgent = getAgent(agentName);
 		state.lastSubagentCommand = `pi --mode json -p --no-session${selectedAgent.model ? ` --model ${selectedAgent.model}` : ""}${selectedAgent.tools && selectedAgent.tools.length > 0 ? ` --tools ${selectedAgent.tools.join(",")}` : ""} --append-system-prompt <temp> "Task: ..."`;
 		persistTask(pi, state);
 		refreshLiveUi(ctx, state);
-		recordProgress(pi, ctx, state, state.stage, `Dispatching ${agentName} (${purpose})`);
-
+		recordProgress(pi, ctx, state, getStageForAgent(agentName), `Dispatching ${agentName} (${purpose})`);
+		recordEvent(state, { type: "agent_started", at: nowIso(), taskId: state.id, agent: agentName, stage: getStageForAgent(agentName), promptPath });
 		const started = Date.now();
 		const heartbeat = setInterval(() => {
 			const secs = Math.floor((Date.now() - started) / 1000);
-			recordProgress(pi, ctx, state, state.stage, `Waiting on ${agentName} (${purpose}) for ${secs}s`);
+			recordProgress(pi, ctx, state, getStageForAgent(agentName), `Waiting on ${agentName} (${purpose}) for ${secs}s`);
 		}, 60_000);
 		let lastUiRefreshMs = 0;
 		const run = await runSubagent(
 			selectedAgent,
 			contextualPrompt,
-			executionPath,
+			state.id,
 			state.repoPath,
 			executionPath,
 			state.worktreeBranch,
+			getStopRequestPath(state.repoPath, state),
 			(kind, text) => {
 				const at = nowIso();
 				const normalizedText = text.replace(/\s+/g, " ").trim().slice(0, 260);
@@ -1181,8 +1284,7 @@ async function runWorkflow(
 				const next = [...(state.streamEvents ?? []), item];
 				state.streamEvents = next.slice(-80);
 				state.lastStreamEvent = `[${agentName}] ${kind} ${normalizedText}`;
-				const liveLogPath = getLiveLogPath(state.repoPath, state);
-				fs.appendFileSync(liveLogPath, `${at} [stream:${agentName}:${kind}] ${normalizedText}\n`, "utf-8");
+				fs.appendFileSync(getLiveLogPath(state.repoPath, state), `${at} [stream:${agentName}:${kind}] ${normalizedText}\n`, "utf-8");
 				const now = Date.now();
 				if (now - lastUiRefreshMs >= 1200) {
 					lastUiRefreshMs = now;
@@ -1193,17 +1295,19 @@ async function runWorkflow(
 		).finally(() => {
 			clearInterval(heartbeat);
 		});
-
 		const resultBody = [
 			`# Agent Result: ${agentName}`,
 			"",
 			`- Purpose: ${purpose}`,
 			`- Exit Code: ${run.exitCode}`,
 			`- OK: ${run.ok}`,
+			`- TimedOut: ${run.timedOut}`,
 			`- DurationMs: ${run.durationMs}`,
 			`- Event Count: ${run.eventCount}`,
 			`- Delta Count: ${run.deltaCount}`,
 			`- Tool Event Count: ${run.toolEventCount}`,
+			`- Stop Requested: ${run.stopRequested}`,
+			`- Tool Signals: ${run.toolSignals.length}`,
 			"",
 			"## Final Assistant Text",
 			run.finalAssistantText || "(empty)",
@@ -1211,14 +1315,14 @@ async function runWorkflow(
 			"## Full Assistant Text",
 			run.fullAssistantText || "(empty)",
 			"",
+			"## Tool Signals",
+			run.toolSignals.length > 0 ? JSON.stringify(run.toolSignals, null, 2) : "(none)",
+			"",
 			"## Stderr",
 			run.stderr || "(empty)",
 			"",
 		].join("\n");
 		fs.writeFileSync(resultPath, resultBody, "utf-8");
-		state.lastResultPath = resultPath;
-		state.activeAgentName = undefined;
-		state.activeAgentPurpose = undefined;
 		fs.writeFileSync(
 			metaPath,
 			JSON.stringify(
@@ -1235,6 +1339,8 @@ async function runWorkflow(
 					eventCount: run.eventCount,
 					deltaCount: run.deltaCount,
 					toolEventCount: run.toolEventCount,
+					stopRequested: run.stopRequested,
+					toolSignals: run.toolSignals,
 					command: state.lastSubagentCommand,
 				},
 				null,
@@ -1242,642 +1348,594 @@ async function runWorkflow(
 			),
 			"utf-8",
 		);
+		state.lastResultPath = resultPath;
+		state.activeAgentName = undefined;
+		state.activeAgentPurpose = undefined;
+		recordEvent(state, {
+			type: "agent_completed",
+			at: nowIso(),
+			taskId: state.id,
+			agent: agentName,
+			stage: getStageForAgent(agentName),
+			resultPath,
+			durationMs: run.durationMs,
+			exitCode: run.exitCode,
+			toolSignals: run.toolSignals.length,
+		});
 		persistTask(pi, state);
 		return run;
 	};
-
 	state.status = "running";
 	persistTask(pi, state);
 	refreshLiveUi(ctx, state);
 	await ensureTaskWorktree(pi, state);
-	recordProgress(
-		pi,
-		ctx,
-		state,
-		"received",
-		`Worktree ready at ${state.worktreePath} on branch ${state.worktreeBranch}`,
-	);
-
-	// 1) Spec stage
-	if (state.specPath && !fs.existsSync(state.specPath)) {
-		state.specPath = undefined;
-	}
-	if (!state.specPath) {
-		recordProgress(pi, ctx, state, "spec", "Generating central spec");
-		const specPrompt = [
-			"Create the central implementation spec for this task.",
-			"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-			"Preferred format: Goal, Constraints, Acceptance Criteria, Complexity Signals, Implementation Phases, Phase Completion Checks, Implementation Notes.",
-			"The spec should be implementation-oriented and phase-driven, with clear completion checks.",
-			"JSON is optional.",
+	clearStopRequest(state.repoPath, state);
+	recordProgress(pi, ctx, state, "received", `Worktree ready at ${state.worktreePath} on branch ${state.worktreeBranch}`);
+	recordEvent(state, {
+		type: state.handoffCount > 0 ? "task_resumed" : "task_started",
+		at: nowIso(),
+		taskId: state.id,
+		repoPath: state.repoPath,
+		worktreePath: state.worktreePath,
+		worktreeBranch: state.worktreeBranch,
+	});
+	let currentAgent = state.currentAgent ?? "spec-writer";
+	let currentMessage =
+		state.lastHandoff?.message ??
+		[
+			"You are the first stage in the orchestration chain.",
+			"Create the implementation brief, choose codex-impl or amp-impl, and hand off to that implementer.",
 			"",
-			`Target repository root path:\n${state.repoPath}`,
+			`Repository root path:\n${state.repoPath}`,
+			`Worktree path:\n${state.worktreePath}`,
 			`User task:\n${state.originalTask}`,
 		].join("\n");
-		const specRun = await runAgent("spec-writer", "spec-generation", specPrompt);
-		if (!specRun.ok) throw new Error(`Spec agent failed: ${specRun.stderr || "unknown error"}`);
-		const specJson = extractJsonObject(specRun.finalAssistantText) ?? extractJsonObject(specRun.fullAssistantText);
-		const specData = normalizeSpecOutput(specRun.finalAssistantText || specRun.fullAssistantText, specJson, state.originalTask);
-
-		const specDir = path.join(state.repoPath, ".pi", "specs");
-		ensureDir(specDir);
-		const specPath = path.join(specDir, `${safeFilename(state.id)}.md`);
-		fs.writeFileSync(specPath, renderSpecMarkdown(state, specData), "utf-8");
-		state.specPath = specPath;
-		state.routedAgent = heuristicRoute(state.originalTask, specData.complexitySignals);
-		recordProgress(pi, ctx, state, "implementation", `Spec created and routed to ${state.routedAgent}`);
-	}
-
-	const specText = fs.readFileSync(state.specPath, "utf-8");
-	if (!state.routedAgent) {
-		state.routedAgent = heuristicRoute(state.originalTask, []);
-		recordProgress(pi, ctx, state, "implementation", `Route recovered to ${state.routedAgent}`);
-	}
-	let iterationFeedback = "";
-
-	// 2) Implementation + review loop
-	let approved = false;
-	while (!approved) {
-		if (state.reviewLoops >= state.maxReviewLoops) {
-			throw new Error("Exceeded max review/fix loops");
+	let purpose = "agent-runtime";
+	while (true) {
+		if (hasStopRequest(state.repoPath, state)) {
+			return failTask("stopped", "Stop requested by user", currentAgent);
 		}
-		state.reviewLoops += 1;
-		recordProgress(pi, ctx, state, "implementation", `Implementation attempt ${state.reviewLoops}`);
-
-		const implPrompt = [
-			"Implement this spec in the repository. Apply real file changes and run relevant local tests.",
-			"Do not commit, push, or check CI in this step. The reviewer stage owns commit/push/CI.",
-			"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-			"Preferred response sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks.",
-			"JSON is optional.",
-			"",
-			`Spec:\n${specText}`,
-			iterationFeedback ? `\nFeedback to address:\n${iterationFeedback}` : "",
-		].join("\n");
-		const implRun = await runAgent(state.routedAgent!, "implementation", implPrompt);
-		if (!implRun.ok) {
-			iterationFeedback = `Implementation agent failed with stderr:\n${implRun.stderr}\nRetry and stabilize changes.`;
-			recordProgress(pi, ctx, state, "fixing", "Implementation subprocess failed; retrying with feedback");
-			continue;
-		}
-		const implJson = extractJsonObject(implRun.finalAssistantText) ?? extractJsonObject(implRun.fullAssistantText);
-		const implNormalized = normalizeImplementationOutput(implRun.finalAssistantText || implRun.fullAssistantText, implJson);
-		state.lastImplSummary = implNormalized.implementationSummary;
-		persistTask(pi, state);
-
-		recordProgress(pi, ctx, state, "review", `Reviewing implementation attempt ${state.reviewLoops}`);
-
-		const reviewPrompt = [
-			"Review the implementation against the spec, focusing on bugs, security, regressions, and missing tests.",
-			"Reviewer stage owns git integration: commit pending changes, push branch, open/update PR, and check CI status.",
-			"Run only the CI checks needed for this repo and include a concise pass/fail summary.",
-			"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-			"Preferred response sections: Approval, Blocking Findings (with severity), Non-blocking Findings, Fix Instructions, Branch / Commits / PR, CI Status.",
-			"JSON is optional.",
-			state.codexReviewSessionId
-				? `Reuse Codex review session id: ${state.codexReviewSessionId} (use codex exec resume).`
-				: "If starting a fresh Codex review session, return codex_session_id in DECISION block.",
-			"",
-			`Spec:\n${specText}`,
-			`Implementation summary:\n${state.lastImplSummary ?? "(none)"}`,
-			`Current branch (if known):\n${state.lastBranchName ?? state.worktreeBranch ?? "(unknown)"}`,
-		].join("\n");
-		const reviewRun = await runAgent("reviewer", "review", reviewPrompt);
-		if (!reviewRun.ok) {
-			iterationFeedback = `Review subprocess failed:\n${reviewRun.stderr}\nRe-run review after stabilizing.`;
-			recordProgress(pi, ctx, state, "fixing", "Review subprocess failed; rerouting to implementation");
-			continue;
-		}
-		const reviewJson = extractJsonObject(reviewRun.finalAssistantText) ?? extractJsonObject(reviewRun.fullAssistantText);
-		const reviewNormalized = normalizeReviewOutput(reviewRun.finalAssistantText || reviewRun.fullAssistantText, reviewJson);
-		state.blockingFindings = reviewNormalized.blockingFindings;
-		if (reviewNormalized.codexSessionId) state.codexReviewSessionId = reviewNormalized.codexSessionId;
-		state.lastBranchName = reviewNormalized.branchName ?? state.lastBranchName;
-		state.lastCommitShas = reviewNormalized.commitShas ?? state.lastCommitShas;
-		state.lastPrUrl = reviewNormalized.prUrl ?? state.lastPrUrl;
-		state.lastPrFailureReason = reviewNormalized.prFailureReason ?? state.lastPrFailureReason;
-		state.lastReviewSummary = reviewRun.finalAssistantText;
-		const reviewerApproved = reviewNormalized.approved;
-		const hasBlocking = state.blockingFindings.some((f) => f.severity === "P0" || f.severity === "P1");
-
-		if (reviewerApproved && !hasBlocking) {
-			approved = true;
-			recordProgress(pi, ctx, state, "validation", "Review approved");
-		} else {
-			const onlyMinorFindings =
-				state.blockingFindings.length > 0 &&
-				state.blockingFindings.every((f) => f.severity === "P2" || f.severity === "P3");
-
-			if (!hasBlocking && onlyMinorFindings) {
-				recordProgress(
-					pi,
-					ctx,
-					state,
-					"review",
-					`Review reported only minor findings on attempt ${state.reviewLoops}; requesting implementation triage`,
-				);
-				const triagePrompt = [
-					"You are triaging non-blocking review findings.",
-					"Decide whether to fix now or defer minor issues and continue to validation.",
-					"Respond with DECISION + DETAILS.",
-					"If deferring, set DECISION loop_back_to: validation and blocking: no.",
-					"",
-					`Review findings:\n${state.blockingFindings.map((f) => `- [${f.severity}] ${f.title}: ${f.description}`).join("\n")}`,
-					`Review fix instructions:\n${reviewNormalized.fixInstructions || "(none)"}`,
-				].join("\n");
-				const triageRun = await runAgent(state.routedAgent!, "review-minor-triage", triagePrompt);
-				if (triageRun.ok) {
-					const triageNormalized = normalizeImplementationOutput(
-						triageRun.finalAssistantText || triageRun.fullAssistantText,
-						extractJsonObject(triageRun.finalAssistantText) ?? extractJsonObject(triageRun.fullAssistantText),
-					);
-					const triageLoop = (triageNormalized.decisionLoopBackTo ?? "").toLowerCase();
-					const triageBlocking = (triageNormalized.decisionBlocking ?? "").toLowerCase();
-					const triageStatus = (triageNormalized.decisionStatus ?? "").toLowerCase();
-					const deferToValidation =
-						(triageLoop === "validation" || triageStatus === "approved") &&
-						!(triageBlocking === "yes" || triageBlocking === "true");
-					if (deferToValidation) {
-						approved = true;
-						recordProgress(
-							pi,
-							ctx,
-							state,
-							"validation",
-							"Implementation triage deferred minor findings; proceeding to validation",
-						);
-						continue;
-					}
-				}
-			}
-
-			const fixInstructions = reviewNormalized.fixInstructions || "Fix reviewer findings and rerun.";
-			iterationFeedback = [
-				`Review failed on attempt ${state.reviewLoops}.`,
-				`Fix instructions: ${fixInstructions}`,
-				`Findings:`,
-				...state.blockingFindings.map((f) => `- [${f.severity}] ${f.title}: ${f.description}`),
-			].join("\n");
-			recordProgress(pi, ctx, state, "fixing", `Review requested fixes on attempt ${state.reviewLoops}`);
-		}
-	}
-
-	// 3) Validation stage (independent agent)
-	let validated = false;
-	while (!validated) {
-		if (state.validationLoops >= state.maxValidationLoops) {
-			throw new Error("Exceeded max validation loops");
-		}
-		state.validationLoops += 1;
-		recordProgress(pi, ctx, state, "validation", `Validation attempt ${state.validationLoops}`);
-
-		const validationPrompt = [
-			"Independently validate this task. Do not trust prior review blindly.",
-			"Check acceptance criteria coverage, regression risk, and test evidence.",
-			"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-			"Preferred response sections: Passed/Failed, Issues, Evidence, Remediation.",
-			"JSON is optional.",
-			"",
-			`Spec:\n${specText}`,
-			`Latest implementation summary:\n${state.lastImplSummary ?? "(none)"}`,
-			`Latest review summary:\n${state.lastReviewSummary ?? "(none)"}`,
-		].join("\n");
-		const validationRun = await runAgent("validator", "validation", validationPrompt);
-		if (!validationRun.ok) {
-			iterationFeedback = `Validation subprocess failed:\n${validationRun.stderr}\nHarden implementation and rerun.`;
-			recordProgress(pi, ctx, state, "fixing", "Validation subprocess failed; returning to implementation");
-			continue;
-		}
-		const validationJson =
-			extractJsonObject(validationRun.finalAssistantText) ?? extractJsonObject(validationRun.fullAssistantText);
-		const validationNormalized = normalizeValidationOutput(
-			validationRun.finalAssistantText || validationRun.fullAssistantText,
-			validationJson,
-		);
-		const passed = validationNormalized.passed;
-		state.validationIssues = validationNormalized.issues;
-		state.lastValidationSummary = validationRun.finalAssistantText;
-		persistTask(pi, state);
-
-		if (passed) {
-			validated = true;
-			recordProgress(pi, ctx, state, "reporting", "Validation passed");
-			break;
-		}
-
-		iterationFeedback = [
-			"Validation failed. Address these issues before retry:",
-			...state.validationIssues.map((x) => `- ${x}`),
-			`Remediation hint: ${validationNormalized.remediation || "Fix issues and re-run validation."}`,
-		].join("\n");
-		recordProgress(pi, ctx, state, "fixing", `Validation requested fixes on attempt ${state.validationLoops}`);
-
-		// Re-enter implementation/review loop for validation failures.
-		approved = false;
-		while (!approved) {
-			if (state.reviewLoops >= state.maxReviewLoops) {
-				throw new Error("Exceeded max review/fix loops during validation remediation");
-			}
+		if (currentAgent === "reviewer") {
+			if (state.reviewLoops >= state.maxReviewLoops) return failTask("max_loops_exceeded", "Exceeded max review loops", currentAgent);
 			state.reviewLoops += 1;
-			recordProgress(
-				pi,
-				ctx,
-				state,
-				"implementation",
-				`Validation remediation implementation attempt ${state.reviewLoops}`,
-			);
-
-			const remediationPrompt = [
-				"Apply fixes required by validation failure.",
-				"Do not commit, push, or check CI in this step. The reviewer stage owns commit/push/CI.",
-				"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-				"Preferred response sections: Implementation Summary, Changed Files, Test Commands, Test Outcomes, Unresolved Risks.",
-				"JSON is optional.",
-				"",
-				`Spec:\n${specText}`,
-				`Validation feedback:\n${iterationFeedback}`,
-			].join("\n");
-			const remediationRun = await runAgent(state.routedAgent!, "validation-remediation-implementation", remediationPrompt);
-			if (!remediationRun.ok) {
-				iterationFeedback = `Remediation implementation failed:\n${remediationRun.stderr}`;
-				recordProgress(pi, ctx, state, "fixing", "Remediation implementation failed; retrying");
-				continue;
-			}
-			const remediationJson =
-				extractJsonObject(remediationRun.finalAssistantText) ?? extractJsonObject(remediationRun.fullAssistantText);
-			const remediationNormalized = normalizeImplementationOutput(
-				remediationRun.finalAssistantText || remediationRun.fullAssistantText,
-				remediationJson,
-			);
-			state.lastImplSummary = remediationNormalized.implementationSummary;
-			persistTask(pi, state);
-
-			recordProgress(pi, ctx, state, "review", `Reviewing validation remediation attempt ${state.reviewLoops}`);
-			const remediationReviewPrompt = [
-				"Review this validation-remediation implementation.",
-				"Reviewer stage owns git integration: commit pending changes, push branch, open/update PR, and check CI status.",
-				"Run only the CI checks needed for this repo and include a concise pass/fail summary.",
-				"Include a DECISION block (status/blocking/loop_back_to/pr_url), then DETAILS in normal English.",
-				"Preferred response sections: Approval, Blocking Findings (with severity), Non-blocking Findings, Fix Instructions, Branch / Commits / PR, CI Status.",
-				"JSON is optional.",
-				state.codexReviewSessionId
-					? `Reuse Codex review session id: ${state.codexReviewSessionId} (use codex exec resume).`
-					: "If starting a fresh Codex review session, return codex_session_id in DECISION block.",
-				"",
-				`Spec:\n${specText}`,
-				`Implementation summary:\n${state.lastImplSummary ?? "(none)"}`,
-				`Validation issues being fixed:\n${state.validationIssues.join("\n")}`,
-			].join("\n");
-			const remediationReviewRun = await runAgent("reviewer", "validation-remediation-review", remediationReviewPrompt);
-			if (!remediationReviewRun.ok) {
-				iterationFeedback = `Remediation review failed:\n${remediationReviewRun.stderr}`;
-				recordProgress(pi, ctx, state, "fixing", "Remediation review failed");
-				continue;
-			}
-			const remediationReviewJson =
-				extractJsonObject(remediationReviewRun.finalAssistantText) ??
-				extractJsonObject(remediationReviewRun.fullAssistantText);
-			const remediationReviewNormalized = normalizeReviewOutput(
-				remediationReviewRun.finalAssistantText || remediationReviewRun.fullAssistantText,
-				remediationReviewJson,
-			);
-			if (remediationReviewNormalized.codexSessionId) {
-				state.codexReviewSessionId = remediationReviewNormalized.codexSessionId;
-			}
-			state.lastBranchName = remediationReviewNormalized.branchName ?? state.lastBranchName;
-			state.lastCommitShas = remediationReviewNormalized.commitShas ?? state.lastCommitShas;
-			state.lastPrUrl = remediationReviewNormalized.prUrl ?? state.lastPrUrl;
-			state.lastPrFailureReason = remediationReviewNormalized.prFailureReason ?? state.lastPrFailureReason;
-			state.blockingFindings = remediationReviewNormalized.blockingFindings;
-			const remediationApproved = remediationReviewNormalized.approved;
-			const remediationHasBlocking = state.blockingFindings.some((f) => f.severity === "P0" || f.severity === "P1");
-			if (remediationApproved && !remediationHasBlocking) {
-				approved = true;
-				recordProgress(pi, ctx, state, "validation", "Remediation review approved");
-			} else {
-				iterationFeedback = remediationReviewNormalized.fixInstructions || "Fix remediation findings.";
-				recordProgress(pi, ctx, state, "fixing", "Remediation review requested additional changes");
-			}
 		}
+		if (currentAgent === "validator") {
+			if (state.validationLoops >= state.maxValidationLoops) return failTask("max_loops_exceeded", "Exceeded max validation loops", currentAgent);
+			state.validationLoops += 1;
+		}
+		const run = await runAgent(currentAgent, purpose, currentMessage);
+		if (run.stopRequested) {
+			return failTask("stopped", "Stop requested by user", currentAgent);
+		}
+		if (!run.ok) {
+			return failTask(run.timedOut ? "timeout" : "subprocess_error", run.stderr || `Agent ${currentAgent} failed`, currentAgent);
+		}
+		const resolvedSignal = resolveToolSignal(currentAgent, run.toolSignals);
+		if (resolvedSignal.error) {
+			return failTask("protocol_violation", resolvedSignal.error, currentAgent);
+		}
+		if (resolvedSignal.warning) {
+			recordProgress(pi, ctx, state, getStageForAgent(currentAgent), resolvedSignal.warning);
+		}
+		const terminalSignal = resolvedSignal.signal!;
+		if (terminalSignal.kind === "handoff") {
+			const payload = terminalSignal.payload;
+			const record: HandoffRecord = {
+				at: nowIso(),
+				fromAgent: currentAgent,
+				toAgent: payload.toAgent,
+				summary: payload.summary,
+				message: payload.message,
+				reason: payload.reason,
+				artifacts: payload.artifacts,
+			};
+			state.handoffCount += 1;
+			state.lastHandoff = record;
+			state.handoffHistory.push(record);
+			state.currentAgent = payload.toAgent;
+			applyArtifactsToState(state, payload.artifacts);
+			if (currentAgent === "spec-writer") {
+				state.routedAgent = payload.toAgent === "amp-impl" ? "amp-impl" : "codex-impl";
+				const specDir = path.join(state.repoPath, ".pi", "specs");
+				ensureDir(specDir);
+				const specPath = path.join(specDir, `${safeFilename(state.id)}.md`);
+				fs.writeFileSync(specPath, buildSpecMarkdown(state, record), "utf-8");
+				state.specPath = specPath;
+			}
+			recordEvent(state, {
+				type: "handoff",
+				at: record.at,
+				taskId: state.id,
+				fromAgent: currentAgent,
+				toAgent: payload.toAgent,
+				summary: payload.summary,
+				reason: payload.reason,
+			});
+			recordProgress(pi, ctx, state, getStageForAgent(payload.toAgent), `${currentAgent} handed off to ${payload.toAgent}: ${payload.summary}`);
+			currentMessage = payload.message;
+			currentAgent = payload.toAgent;
+			purpose = `${record.fromAgent}-handoff`;
+			continue;
+		}
+		if (terminalSignal.kind === "workflow_bug") {
+			const payload = terminalSignal.payload;
+			recordProgress(pi, ctx, state, getStageForAgent(currentAgent), `workflow bug: ${payload.summary}`);
+			if (payload.terminate) {
+				return failTask("workflow_bug_reported", `${payload.summary}\n${payload.details}`, currentAgent);
+			}
+			return failTask("protocol_violation", `Non-terminal workflow bug report left run without next action: ${payload.summary}`, currentAgent);
+		}
+		const payload = terminalSignal.payload;
+		applyArtifactsToState(state, payload.artifacts);
+		state.finalReport = payload.report;
+		state.currentAgent = currentAgent;
+		state.status = payload.outcome === "completed" ? "completed" : "failed";
+		state.stage = payload.outcome === "completed" ? "done" : "failed";
+		recordEvent(state, {
+			type: "finish",
+			at: nowIso(),
+			taskId: state.id,
+			agent: currentAgent,
+			outcome: payload.outcome,
+			summary: payload.summary,
+		});
+		recordProgress(pi, ctx, state, state.stage, payload.summary);
+		saveFinalArtifacts(state);
+		persistTask(pi, state);
+		return state;
 	}
-
-	// 4) Final report stage
-	recordProgress(pi, ctx, state, "reporting", "Generating final report for main agent");
-
-	const reporterPrompt = [
-		"Generate the final handoff report for the main orchestrating agent.",
-		"Include: outcome, what was changed, test/validation confidence, open risks, and deployment readiness.",
-		"",
-		`State summary:\n${summarizeState(state)}`,
-		`Implementation summary:\n${state.lastImplSummary ?? "(none)"}`,
-		`Branch:\n${state.lastBranchName ?? "(none)"}`,
-		`PR URL:\n${state.lastPrUrl ?? "(none)"}`,
-		`PR failure reason:\n${state.lastPrFailureReason ?? "(none)"}`,
-		`Review summary:\n${state.lastReviewSummary ?? "(none)"}`,
-		`Validation summary:\n${state.lastValidationSummary ?? "(none)"}`,
-	].join("\n");
-
-	let reporterOutput = "";
-	const reporterRun = await runAgent("reporter", "final-report", reporterPrompt);
-	if (reporterRun.ok) {
-		reporterOutput = reporterRun.finalAssistantText || reporterRun.fullAssistantText;
-	} else {
-		reporterOutput = `Reporter agent failed. stderr:\n${reporterRun.stderr}`;
-	}
-
-	state.status = "completed";
-	recordProgress(pi, ctx, state, "done", "Workflow completed");
-
-	const reportMarkdown = buildReportMarkdown(state, reporterOutput);
-	saveFinalArtifacts(state.repoPath, state, reportMarkdown);
-	persistTask(pi, state);
-	await sendReportToMainAgentWebhook(state);
-
-	return state;
 }
 
-function parseTitle(task: string): string {
-	const oneLine = task.trim().split("\n")[0] ?? "Untitled task";
-	return oneLine.length > 96 ? `${oneLine.slice(0, 93)}...` : oneLine;
+function summarizeState(state: TaskState): string {
+	return [
+		`Task ${state.id}: ${state.title}`,
+		`Status: ${state.status}`,
+		`Stage: ${state.stage}`,
+		`Repo: ${state.repoPath}`,
+		state.worktreePath ? `Worktree: ${state.worktreePath}` : undefined,
+		state.worktreeBranch ? `Branch: ${state.worktreeBranch}` : undefined,
+		state.currentAgent ? `Current agent: ${state.currentAgent}` : undefined,
+		state.lastHandoff ? `Last handoff: ${state.lastHandoff.fromAgent} -> ${state.lastHandoff.toAgent}` : undefined,
+		state.failureKind ? `Failure: ${state.failureKind} ${state.failureDetails ?? ""}` : undefined,
+	].filter(Boolean).join("\n");
 }
 
-function createTask(taskInput: string, cwd: string): TaskState {
-	const created = nowIso();
-	const repoPath = deriveRepoPathFromTask(taskInput, cwd);
+function loadPersistedTasks(ctx: ExtensionContext): Map<string, TaskState> {
+	const entries = ctx.sessionManager.getEntries();
+	const tasks = new Map<string, TaskState>();
+	for (const entry of entries) {
+		const e = entry as { type?: string; customType?: string; data?: TaskState };
+		if (e.type !== "custom" || e.customType !== "pi-orchestrator-task" || !e.data?.id) continue;
+		tasks.set(e.data.id, {
+			...e.data,
+			repoPath: e.data.repoPath ?? ctx.cwd,
+			maxReviewLoops: e.data.maxReviewLoops ?? 3,
+			maxValidationLoops: e.data.maxValidationLoops ?? 3,
+			reviewLoops: e.data.reviewLoops ?? 0,
+			validationLoops: e.data.validationLoops ?? 0,
+			handoffCount: e.data.handoffCount ?? 0,
+			handoffHistory: e.data.handoffHistory ?? [],
+			blockingFindings: e.data.blockingFindings ?? [],
+			validationIssues: e.data.validationIssues ?? [],
+			widgetMode: e.data.widgetMode ?? readWidgetMode(e.data.repoPath ?? ctx.cwd, e.data.worktreePath, ctx.cwd),
+		});
+	}
+	return tasks;
+}
+
+function loadTaskById(ctx: ExtensionContext, taskId: string): TaskState | undefined {
+	return loadPersistedTasks(ctx).get(taskId);
+}
+
+function newTaskState(taskInput: string, repoPath: string): TaskState {
+	const id = `task-${Date.now()}-${randomUUID().slice(0, 8)}`;
 	return {
-		id: `task-${Date.now()}-${randomUUID().slice(0, 8)}`,
-		title: parseTitle(taskInput),
-		originalTask: taskInput.trim(),
+		id,
+		title: taskInput.length > 80 ? `${taskInput.slice(0, 77)}...` : taskInput,
+		originalTask: taskInput,
 		repoPath,
 		status: "queued",
 		stage: "received",
-		createdAt: created,
-		updatedAt: created,
+		createdAt: nowIso(),
+		updatedAt: nowIso(),
 		reviewLoops: 0,
 		validationLoops: 0,
 		maxReviewLoops: 3,
 		maxValidationLoops: 3,
+		handoffCount: 0,
+		handoffHistory: [],
 		blockingFindings: [],
 		validationIssues: [],
-		history: [{ at: created, stage: "received", note: "Task received by Pi orchestrator" }],
+		history: [],
+		streamEvents: [],
 	};
 }
 
-async function handleRun(
-	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
-	state: TaskState,
-	inMemoryTasks: Map<string, TaskState>,
-): Promise<void> {
-	const agents = loadProjectAgents(ctx.cwd);
-	const required = ["spec-writer", "codex-impl", "amp-impl", "reviewer", "validator", "reporter"];
-	const missing = required.filter((x) => !agents.has(x));
-	if (missing.length > 0) {
-		throw new Error(`Missing required .pi/agents definitions: ${missing.join(", ")}`);
+function loadToolTaskState(): TaskState {
+	const repoPath = process.env.PI_ORCHESTRATOR_REPO_PATH;
+	const taskId = process.env.PI_ORCHESTRATOR_TASK_ID;
+	if (!repoPath || !taskId) {
+		throw new Error("Missing orchestrator task context");
 	}
+	const statePath = path.join(repoPath, ".pi", "reports", `${safeFilename(taskId)}.state.json`);
+	const raw = fs.readFileSync(statePath, "utf-8");
+	return JSON.parse(raw) as TaskState;
+}
 
-	inMemoryTasks.set(state.id, state);
-	persistTask(pi, state);
-
-	try {
-		const finalState = await runWorkflow(pi, ctx, state, agents);
-		refreshLiveUi(ctx, finalState);
-		pi.sendMessage(
-			{
-				customType: "pi-orchestrator-report",
-				display: true,
-				content: [
-					"Pi orchestrator completed task.",
-					"",
-					summarizeState(finalState),
-					"",
-					`Report JSON: ${finalState.reportJsonPath}`,
-					`Report Markdown: ${finalState.reportMarkdownPath}`,
-				].join("\n"),
-			},
-			{ triggerTurn: false },
-		);
-	} catch (err) {
-		state.status = "failed";
-		recordProgress(pi, ctx, state, "failed", err instanceof Error ? err.message : String(err));
-		pi.sendMessage(
-			{
-				customType: "pi-orchestrator-report",
-				display: true,
-				content: [
-					"Pi orchestrator failed task.",
-					"",
-					summarizeState(state),
-					"",
-					`Error: ${err instanceof Error ? err.message : String(err)}`,
-				].join("\n"),
-			},
-			{ triggerTurn: false },
-		);
-		throw err;
-	}
+function persistToolTaskState(state: TaskState): void {
+	writeJsonAtomic(getLiveStatePath(state.repoPath, state), state);
 }
 
 export default function piOrchestratorExtension(pi: ExtensionAPI): void {
-	const tasks = new Map<string, TaskState>();
-	let activeTaskId: string | undefined;
-
-	pi.on("session_start", async (_event, ctx) => {
-		const restored = loadPersistedTasks(ctx);
-		for (const [id, state] of restored) tasks.set(id, state);
-		const running = Array.from(tasks.values()).find((t) => t.status === "running");
-		if (running) {
-			refreshLiveUi(ctx, running);
-			ctx.ui.notify(`Resume with /orchestrate-resume ${running.id}`, "info");
-		}
+	pi.registerTool({
+		name: "write_prompt",
+		label: "write_prompt",
+		description: "Write the full prompt that will be used for the delegated coding agent run.",
+		promptSnippet: "Call write_prompt(prompt) before dispatch_coding_agent.",
+		promptGuidelines: [
+			"Use write_prompt to prepare the full delegated task prompt.",
+			"Include the task-specific instructions only; the runtime will inject repo/worktree/progress context.",
+		],
+		parameters: Type.Object({
+			prompt: Type.String({ description: "Full prompt body for the delegated coding run." }),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const { prompt } = params as { prompt: string };
+			const state = loadToolTaskState();
+			const promptPath = writePromptDraft(state, prompt);
+			persistToolTaskState(state);
+			return {
+				content: [{ type: "text", text: `Prompt saved to ${promptPath}` }],
+				details: { action: "write_prompt", promptPath },
+			};
+		},
 	});
-
+	pi.registerTool({
+		name: "dispatch_coding_agent",
+		label: "dispatch_coding_agent",
+		description: "Dispatch Codex or Amp against the active worktree using the current prompt draft.",
+		promptSnippet: "Call dispatch_coding_agent(provider, task_kind, resume_session_id?) to run Codex/Amp in the active worktree.",
+		promptGuidelines: [
+			"dispatch_coding_agent is the only way to run delegated coding or review work.",
+			"Do not use bash or file tools for implementation, review, or validation work.",
+		],
+		parameters: Type.Object({
+			provider: Type.Union([Type.Literal("codex"), Type.Literal("amp")]),
+			task_kind: Type.Union([
+				Type.Literal("spec"),
+				Type.Literal("implementation"),
+				Type.Literal("review"),
+				Type.Literal("validation"),
+			]),
+			resume_session_id: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const activeAgent = process.env.PI_ORCHESTRATOR_ACTIVE_AGENT as RuntimeAgent | undefined;
+			if (!activeAgent) throw new Error("dispatch_coding_agent is only available inside an orchestrator stage");
+			const { provider, task_kind, resume_session_id } = params as {
+				provider: "codex" | "amp";
+				task_kind: "spec" | "implementation" | "review" | "validation";
+				resume_session_id?: string;
+			};
+			const state = loadToolTaskState();
+			const result = await dispatchCodingRun(state, activeAgent, provider, task_kind, resume_session_id);
+			if (result.sessionId && task_kind === "review") {
+				state.codexReviewSessionId = result.sessionId;
+			}
+			persistToolTaskState(state);
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`Delegated ${provider} ${task_kind} run ${result.ok ? "succeeded" : "failed"}.`,
+							`Duration: ${result.durationMs}ms`,
+							`Prompt: ${result.promptPath}`,
+							`Result: ${result.resultPath}`,
+							`Session: ${result.sessionId ?? "n/a"}`,
+							"",
+							"Final assistant text:",
+							result.finalAssistantText,
+						].join("\n"),
+					},
+				],
+				details: {
+					action: "dispatch_coding_agent",
+					ok: result.ok,
+					provider,
+					taskKind: task_kind,
+					durationMs: result.durationMs,
+					promptPath: result.promptPath,
+					resultPath: result.resultPath,
+					sessionId: result.sessionId,
+				},
+			};
+		},
+	});
+	pi.registerTool({
+		name: "append_progress",
+		label: "append_progress",
+		description: "Append one short factual line to the shared progress.md ledger.",
+		promptSnippet: "Call append_progress(entry) with one short line before handoff/finish.",
+		promptGuidelines: [
+			"Keep progress entries minimal.",
+			"Do not duplicate the full handoff contents in progress.md.",
+		],
+		parameters: Type.Object({
+			entry: Type.String({ description: "Short factual progress update." }),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const activeAgent = process.env.PI_ORCHESTRATOR_ACTIVE_AGENT as RuntimeAgent | undefined;
+			if (!activeAgent) throw new Error("append_progress is only available inside an orchestrator stage");
+			const { entry } = params as { entry: string };
+			const state = loadToolTaskState();
+			appendProgressEntry(state, activeAgent, entry);
+			persistToolTaskState(state);
+			return {
+				content: [{ type: "text", text: `Progress updated in ${getProgressPath(state.repoPath, state)}` }],
+				details: { action: "append_progress" },
+			};
+		},
+	});
+	pi.registerTool({
+		name: "handoff",
+		label: "handoff",
+		description: "Hand the orchestration task to the next stage agent.",
+		promptSnippet: "Call handoff(to_agent, message, summary, artifacts?, reason?) exactly once to pass control to the next agent.",
+		promptGuidelines: [
+			"handoff is a custom Pi tool, not a shell command.",
+			"Call handoff directly instead of writing prose that implies a handoff.",
+			"Do not search the filesystem or PATH for handoff.",
+		],
+		parameters: Type.Object({
+			to_agent: Type.Union([
+				Type.Literal("codex-impl"),
+				Type.Literal("amp-impl"),
+				Type.Literal("reviewer"),
+				Type.Literal("validator"),
+				Type.Literal("reporter"),
+			]),
+			message: Type.String({ description: "Full handoff message for the next agent." }),
+			summary: Type.String({ description: "Short summary for logs and UI." }),
+			artifacts: Type.Optional(Type.Any()),
+			reason: Type.Optional(Type.String()),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const { to_agent, summary } = params as {
+				to_agent: HandoffTarget;
+				summary: string;
+			};
+			return {
+				content: [{ type: "text", text: `Handoff recorded for ${to_agent}: ${summary}` }],
+				details: { action: "handoff" },
+			};
+		},
+	});
+	pi.registerTool({
+		name: "finish",
+		label: "finish",
+		description: "Finish the orchestration run with a final report.",
+		promptSnippet: "Call finish(outcome, summary, report, artifacts?) exactly once to terminate the workflow.",
+		promptGuidelines: [
+			"finish is a custom Pi tool, not a shell command.",
+			"Call finish directly instead of only stating the task is done or failed in prose.",
+			"Do not search the filesystem or PATH for finish.",
+		],
+		parameters: Type.Object({
+			outcome: Type.Union([Type.Literal("completed"), Type.Literal("failed")]),
+			summary: Type.String({ description: "Short final summary." }),
+			report: Type.String({ description: "Final report body." }),
+			artifacts: Type.Optional(Type.Any()),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const { outcome, summary } = params as { outcome: "completed" | "failed"; summary: string };
+			return {
+				content: [{ type: "text", text: `Workflow ${outcome}: ${summary}` }],
+				details: { action: "finish" },
+			};
+		},
+	});
+	pi.registerTool({
+		name: "report_bug_in_workflow",
+		label: "report_bug_in_workflow",
+		description: "Report an orchestration/runtime bug rather than a bug in the target repository.",
+		promptSnippet: "Call report_bug_in_workflow(summary, details, terminate?) when the workflow itself is broken.",
+		promptGuidelines: [
+			"Only use this for workflow/runtime issues, not repository bugs.",
+			"Set terminate=true if the run cannot continue safely.",
+		],
+		parameters: Type.Object({
+			summary: Type.String({ description: "Short workflow bug summary." }),
+			details: Type.String({ description: "Detailed explanation of the workflow/runtime problem." }),
+			terminate: Type.Optional(Type.Boolean()),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const { summary, terminate } = params as { summary: string; terminate?: boolean };
+			return {
+				content: [{ type: "text", text: `Workflow bug reported${terminate ? " and marked terminal" : ""}: ${summary}` }],
+				details: { action: "report_bug_in_workflow" },
+			};
+		},
+	});
 	pi.registerCommand("orchestrate", {
-		description: "Run autonomous Pi orchestration: spec -> implement -> review/fix -> validate -> report",
-		handler: async (args, ctx) => {
-			const taskInput = (args ?? "").trim();
-			if (!taskInput) {
-				ctx.ui.notify("Usage: /orchestrate <task description>", "warning");
+		description: "Start an agent-directed orchestration task",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const parsedArgs = parseOrchestrateArgs(args, ctx.cwd);
+			if (parsedArgs.error || !parsedArgs.repoPath || !parsedArgs.taskInput) {
+				ctx.ui.notify(parsedArgs.error ?? "Usage: /orchestrate <repo-path> -- <task description>", "warning");
 				return;
 			}
-			if (activeTaskId) {
-				ctx.ui.notify(`Task ${activeTaskId} is already running. Use /orchestrate-status`, "warning");
+			const { repoPath, taskInput } = parsedArgs;
+			const tasks = loadPersistedTasks(ctx);
+			const running = Array.from(tasks.values()).find((task) => task.status === "running");
+			if (running) {
+				ctx.ui.notify(`Task ${running.id} is already running. Use /orchestrate-status`, "warning");
 				return;
 			}
-			const state = createTask(taskInput, ctx.cwd);
-			activeTaskId = state.id;
+			const agents = loadProjectAgents(ctx.cwd);
+			const required: RuntimeAgent[] = ["spec-writer", "codex-impl", "amp-impl", "reviewer", "validator", "reporter"];
+			const missing = required.filter((name) => !agents.has(name));
+			if (missing.length > 0) {
+				ctx.ui.notify(`Missing required agents: ${missing.join(", ")}`, "error");
+				return;
+			}
+			const state = newTaskState(taskInput, repoPath);
+			recordProgress(pi, ctx, state, "received", "Task received");
 			try {
-				await handleRun(pi, ctx, state, tasks);
-			} finally {
-				activeTaskId = undefined;
+				await runWorkflow(pi, ctx, state, agents);
+				ctx.ui.notify(`Task ${state.id} ${state.status}`, state.status === "completed" ? "info" : "warning");
+			} catch (error) {
+				state.status = "failed";
+				state.stage = "failed";
+				state.failureKind = "subprocess_error";
+				state.failureDetails = error instanceof Error ? error.message : String(error);
+				recordProgress(pi, ctx, state, "failed", state.failureDetails);
+				saveFinalArtifacts(state);
+				persistTask(pi, state);
+				ctx.ui.notify(`Task ${state.id} failed: ${state.failureDetails}`, "error");
 			}
 		},
 	});
-
 	pi.registerCommand("orchestrate-status", {
-		description: "Show Pi orchestrator task summaries",
-		handler: async (_args, ctx) => {
-			if (tasks.size === 0) {
-				ctx.ui.notify("No orchestrator tasks found yet.", "info");
+		description: "Show orchestrator task summary",
+		handler: async (_args: string, ctx: ExtensionCommandContext) => {
+			const tasks = Array.from(loadPersistedTasks(ctx).values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+			if (tasks.length === 0) {
+				ctx.ui.notify("No orchestrator tasks found", "info");
 				return;
 			}
-			const ordered = Array.from(tasks.values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-			const summary = ordered
-				.slice(0, 8)
-				.map((t) => `- ${t.id} | ${t.status} | ${t.stage} | ${t.title} | ${t.history[t.history.length - 1]?.note ?? ""}`)
-				.join("\n");
-			ctx.ui.notify(`Recent tasks:\n${summary}`, "info");
+			const lines = tasks.slice(0, 10).map((task) => `${task.id} | ${task.status} | ${task.stage} | ${task.currentAgent ?? "idle"} | ${task.title}`);
+			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
-
+	pi.registerCommand("orchestrate-stop", {
+		description: "Request stop for a running task: /orchestrate-stop <task-id>",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const taskId = args.trim();
+			if (!taskId) {
+				ctx.ui.notify("Usage: /orchestrate-stop <task-id>", "warning");
+				return;
+			}
+			const task = loadTaskById(ctx, taskId);
+			if (!task) {
+				ctx.ui.notify(`Task not found: ${taskId}`, "error");
+				return;
+			}
+			writeStopRequest(task.repoPath, task, `Stop requested at ${nowIso()}`);
+			recordProgress(pi, ctx, task, task.stage === "done" ? "done" : task.stage, "Stop requested by /orchestrate-stop");
+			ctx.ui.notify(`Stop requested for ${taskId}`, "info");
+		},
+	});
 	pi.registerCommand("orchestrate-widget", {
-		description: "Set widget view mode: /orchestrate-widget <compact|spec|prompt|result|history|stream>",
-		handler: async (args, ctx) => {
-			const mode = ((args ?? "").trim().toLowerCase() || "compact") as WidgetMode;
-			if (!widgetModes.includes(mode)) {
-				ctx.ui.notify("Usage: /orchestrate-widget <compact|spec|prompt|result|history|stream>", "warning");
+		description: "Set widget view mode: /orchestrate-widget <compact|handoff|prompt|result|history|stream>",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const mode = args.trim().toLowerCase() as WidgetMode;
+			if (!WIDGET_MODES.includes(mode)) {
+				ctx.ui.notify("Usage: /orchestrate-widget <compact|handoff|prompt|result|history|stream>", "warning");
 				return;
 			}
 			const repoPaths = new Set<string>([ctx.cwd]);
-			for (const task of tasks.values()) {
+			for (const task of loadPersistedTasks(ctx).values()) {
 				repoPaths.add(task.repoPath);
 				if (task.worktreePath) repoPaths.add(task.worktreePath);
 				task.widgetMode = mode;
-				persistTask(pi, task);
 			}
 			writeWidgetMode(mode, Array.from(repoPaths));
-			const active = activeTaskId ? tasks.get(activeTaskId) : undefined;
-			const latest =
-				active ??
-				Array.from(tasks.values())
-					.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-					.at(0);
-			if (latest) refreshLiveUi(ctx, latest);
 			ctx.ui.notify(`Orchestrator widget mode: ${mode}`, "info");
 		},
 	});
-
 	pi.registerCommand("orchestrate-log", {
 		description: "Show detailed stage history for one task: /orchestrate-log <task-id>",
-		handler: async (args, ctx) => {
-			const taskId = (args ?? "").trim();
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const taskId = args.trim();
 			if (!taskId) {
 				ctx.ui.notify("Usage: /orchestrate-log <task-id>", "warning");
 				return;
 			}
-			const task = tasks.get(taskId) ?? loadTaskById(ctx, taskId);
+			const task = loadTaskById(ctx, taskId);
 			if (!task) {
-				ctx.ui.notify(`Task not found: ${taskId}`, "warning");
+				ctx.ui.notify(`Task not found: ${taskId}`, "error");
 				return;
 			}
-			const lines = task.history.map((h) => `- ${h.at} | ${h.stage} | ${h.note}`).join("\n");
-			ctx.ui.notify(`History for ${taskId}:\n${lines}`, "info");
-			refreshLiveUi(ctx, task);
+			const lines = [
+				summarizeState(task),
+				"",
+				...task.history.map((entry) => `${entry.at} | ${entry.stage} | ${entry.note}`),
+			];
+			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
-
 	pi.registerCommand("orchestrate-trace", {
 		description: "Show prompt/response trace files: /orchestrate-trace <task-id>",
-		handler: async (args, ctx) => {
-			const taskId = (args ?? "").trim();
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const taskId = args.trim();
 			if (!taskId) {
 				ctx.ui.notify("Usage: /orchestrate-trace <task-id>", "warning");
 				return;
 			}
-			const task = tasks.get(taskId) ?? loadTaskById(ctx, taskId);
+			const task = loadTaskById(ctx, taskId);
 			if (!task) {
-				ctx.ui.notify(`Task not found: ${taskId}`, "warning");
+				ctx.ui.notify(`Task not found: ${taskId}`, "error");
 				return;
 			}
 			const traceDir = task.traceDir ?? getTraceDir(task.repoPath, task);
-			if (!fs.existsSync(traceDir)) {
-				ctx.ui.notify(`No trace directory yet: ${traceDir}`, "info");
-				return;
-			}
-			const files = fs
-				.readdirSync(traceDir)
-				.filter((f) => f.endsWith(".prompt.md") || f.endsWith(".result.md") || f.endsWith(".meta.json"))
-				.sort()
-				.slice(-24)
-				.map((f) => `- ${path.join(traceDir, f)}`);
-			ctx.ui.notify(
-				`Trace files for ${taskId}:\n${files.join("\n") || "(none yet)"}\n\nTip: open *.prompt.md to see exact prompts, *.result.md for outputs.`,
-				"info",
-			);
+			const files = fs.existsSync(traceDir)
+				? fs.readdirSync(traceDir).filter((file) => file.endsWith(".prompt.md") || file.endsWith(".result.md") || file.endsWith(".meta.json"))
+				: [];
+			ctx.ui.notify(`Trace files for ${taskId}:\n${files.join("\n") || "(none yet)"}`, "info");
 		},
 	});
-
 	pi.registerCommand("orchestrate-tail", {
 		description: "Show the latest live stream log lines for one task: /orchestrate-tail <task-id>",
-		handler: async (args, ctx) => {
-			const taskId = (args ?? "").trim();
-			const defaultTaskId =
-				activeTaskId ??
-				Array.from(tasks.values())
-					.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-					.at(0)?.id;
-			const resolvedTaskId = taskId || defaultTaskId;
-			if (!resolvedTaskId) {
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const taskId = args.trim();
+			if (!taskId) {
 				ctx.ui.notify("Usage: /orchestrate-tail <task-id>", "warning");
 				return;
 			}
-			const task = tasks.get(resolvedTaskId) ?? loadTaskById(ctx, resolvedTaskId);
+			const task = loadTaskById(ctx, taskId);
 			if (!task) {
-				ctx.ui.notify(`Task not found: ${resolvedTaskId}`, "warning");
+				ctx.ui.notify(`Task not found: ${taskId}`, "error");
 				return;
 			}
-			const liveLogPath = task.liveLogPath ?? getLiveLogPath(task.repoPath ?? ctx.cwd, task);
-			if (!fs.existsSync(liveLogPath)) {
-				ctx.ui.notify(`No live log yet: ${liveLogPath}`, "info");
-				return;
-			}
-			const allLines = fs
-				.readFileSync(liveLogPath, "utf-8")
-				.split("\n")
-				.map((x) => x.trimEnd())
-				.filter(Boolean);
-			const streamLines = allLines.filter((line) => line.includes("[stream:"));
-			const streamTail = streamLines.slice(-80);
-			const rawTail = allLines.slice(-80);
-			const lines = streamTail.length > 0 ? streamTail : rawTail;
-			ctx.ui.notify(
-				`Live log tail for ${resolvedTaskId} (${liveLogPath})${streamTail.length > 0 ? " [stream lines]" : " [all lines]"}:\n${lines.join("\n")}`,
-				"info",
-			);
-			refreshLiveUi(ctx, task);
+			const liveLogPath = task.liveLogPath ?? getLiveLogPath(task.repoPath, task);
+			const tail = fs.existsSync(liveLogPath)
+				? fs.readFileSync(liveLogPath, "utf-8").split("\n").filter(Boolean).slice(-80)
+				: [];
+			ctx.ui.notify(tail.join("\n") || "(no log yet)", "info");
 		},
 	});
-
 	pi.registerCommand("orchestrate-resume", {
-		description: "Resume a previously failed/running orchestrator task by id",
-		handler: async (args, ctx) => {
-			const taskId = (args ?? "").trim();
+		description: "Resume a failed/interrupted task: /orchestrate-resume <task-id>",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const taskId = args.trim();
 			if (!taskId) {
 				ctx.ui.notify("Usage: /orchestrate-resume <task-id>", "warning");
 				return;
 			}
-			if (activeTaskId) {
-				ctx.ui.notify(`Task ${activeTaskId} is already running.`, "warning");
+			const task = loadTaskById(ctx, taskId);
+			if (!task) {
+				ctx.ui.notify(`Task not found: ${taskId}`, "error");
 				return;
 			}
-			const fromMemory = tasks.get(taskId);
-			const fromSession = fromMemory ?? loadTaskById(ctx, taskId);
-			if (!fromSession) {
-				ctx.ui.notify(`Task not found: ${taskId}`, "warning");
+			if (task.status === "completed") {
+				ctx.ui.notify(`Task ${taskId} is already completed`, "info");
 				return;
 			}
-			const state: TaskState = {
-				...fromSession,
-				repoPath: fromSession.repoPath ?? ctx.cwd,
-				status: "queued",
-				updatedAt: nowIso(),
-			};
-			recordProgress(pi, ctx, state, "received", "Task resumed by /orchestrate-resume");
-			activeTaskId = state.id;
+			const agents = loadProjectAgents(ctx.cwd);
+			recordProgress(pi, ctx, task, "received", "Task resumed by /orchestrate-resume");
 			try {
-				await handleRun(pi, ctx, state, tasks);
-			} finally {
-				activeTaskId = undefined;
+				await runWorkflow(pi, ctx, task, agents);
+					ctx.ui.notify(`Task ${task.id} ${task.status}`, "info");
+			} catch (error) {
+				task.status = "failed";
+				task.stage = "failed";
+				task.failureKind = "subprocess_error";
+				task.failureDetails = error instanceof Error ? error.message : String(error);
+				recordProgress(pi, ctx, task, "failed", task.failureDetails);
+				saveFinalArtifacts(task);
+				persistTask(pi, task);
+				ctx.ui.notify(`Task ${task.id} failed: ${task.failureDetails}`, "error");
 			}
 		},
 	});

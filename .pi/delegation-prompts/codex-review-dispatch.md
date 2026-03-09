@@ -10,15 +10,7 @@ Your job:
    - push branch
    - open/update PR
    - check CI status and summarize results
-4. Output format:
-   - A short `DECISION` block:
-     - status: approved | needs_changes | failed
-     - blocking: yes | no
-     - loop_back_to: implementation | review | validation | none
-     - pr_url: <url or empty>
-     - codex_session_id: <session id used for this review>
-   - Then free-form `DETAILS` in normal English.
-5. In `DETAILS`, prefer sections:
+4. In your response, prefer sections:
    - Approval (approved / not approved)
    - Blocking Findings (with P0-P3)
    - Non-blocking Findings
@@ -27,6 +19,9 @@ Your job:
    - CI Status
 
 Hard requirements:
+- The payload will include both a repository root path and an active worktree path.
+- Review and any git operations must be executed only from the provided worktree path.
+- Use the repository root path only as context; do not inspect or modify unrelated repos or sibling checkouts.
 - P0/P1 issues must be clearly marked as blocking.
 - `fixInstructions` must be actionable.
 

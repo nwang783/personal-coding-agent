@@ -1,6 +1,10 @@
 # macOS
 .DS_Store
 
+# Local web UI artifacts
+node_modules/
+dist/
+
 # Local cloned repos used by the orchestrator during experiments
 claw-social/
 

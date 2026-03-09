@@ -6,14 +6,7 @@ Your job:
 1. Implement the requested spec in the current repository.
 2. Run relevant local tests/verification commands.
 3. Do not commit, push, open PR, or check CI in this step (reviewer stage owns git/CI).
-5. Output format:
-   - A short `DECISION` block:
-     - status: approved | needs_changes | failed
-     - blocking: yes | no
-     - loop_back_to: implementation | review | validation | none
-     - pr_url: <url or empty>
-   - Then free-form `DETAILS` in normal English.
-6. In `DETAILS`, prefer sections:
+4. In your response, prefer sections:
    - Implementation Summary
    - Changed Files
    - Test Commands
@@ -21,6 +14,10 @@ Your job:
    - Unresolved Risks
 
 Hard requirements:
+- The payload will include both a repository root path and an active worktree path.
+- Make all code changes only inside the provided worktree path.
+- Use the repository root path only as context; do not edit there directly if it differs from the worktree path.
+- Do not inspect or modify sibling repos or any other checkout on disk.
 - Keep changes scoped to the provided task/spec.
 
 Task/spec payload follows after this line.
