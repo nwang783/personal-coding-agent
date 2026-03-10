@@ -147,4 +147,12 @@ export type TaskDetail = {
     path: string;
     kind: "prompt" | "result" | "meta" | "other";
   }>;
+  artifactFiles: Array<{
+    name: string;
+    relativePath: string;
+    path: string;
+    url: string;
+    kind: "image" | "text" | "other";
+    preview?: string;
+  }>;
 };

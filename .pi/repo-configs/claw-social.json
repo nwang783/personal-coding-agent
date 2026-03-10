@@ -1,0 +1,89 @@
+{
+  "repoPath": "/Users/nathanwang/Projects/claw-social",
+  "worktree": {
+    "defaultMode": "symlink",
+    "sync": [
+      "api/.env",
+      "vite-react/.env"
+    ]
+  },
+  "promptContext": {
+    "files": [
+      "README.md",
+      "api/src/app.ts",
+      "vite-react/src/lib/apiBase.ts"
+    ]
+  },
+  "validation": {
+    "services": [
+      {
+        "id": "api",
+        "name": "API",
+        "cwd": "api",
+        "command": "npm run dev",
+        "url": "http://localhost:3001/v1",
+        "ready": {
+          "type": "http",
+          "url": "http://localhost:3001/health"
+        },
+        "envFiles": [
+          "api/.env"
+        ],
+        "purpose": "Backend API for frontend flows. In development the CORS middleware allows localhost origins, so pair this with a localhost frontend instead of 127.0.0.1."
+      },
+      {
+        "id": "frontend",
+        "name": "Frontend",
+        "cwd": "vite-react",
+        "command": "npm run dev -- --host localhost --port 5173",
+        "url": "http://localhost:5173",
+        "ready": {
+          "type": "http",
+          "url": "http://localhost:5173"
+        },
+        "envFiles": [
+          "vite-react/.env"
+        ],
+        "purpose": "Primary browser demo surface for validation. Use localhost to satisfy the API's dev CORS allowlist."
+      }
+    ],
+    "demoScenarios": [
+      {
+        "id": "home-page-loads",
+        "name": "Home page loads",
+        "url": "http://localhost:5173",
+        "steps": [
+          "Open the home page in a browser.",
+          "Confirm the page loads without a fatal error screen.",
+          "Capture at least one screenshot."
+        ],
+        "expectedEvidence": [
+          "Home page reachable in browser",
+          "No fatal startup/runtime error on first load"
+        ],
+        "screenshots": [
+          "home.png"
+        ]
+      },
+      {
+        "id": "docs-link-visible",
+        "name": "Docs link is visible on landing page",
+        "url": "http://localhost:5173",
+        "steps": [
+          "Open the landing page in desktop and mobile browser sizes.",
+          "Confirm the docs-site/docs navigation link is visible in both layouts.",
+          "Capture desktop and mobile screenshots showing the docs link."
+        ],
+        "expectedEvidence": [
+          "Landing page renders at localhost without CORS errors blocking the main experience",
+          "Docs link is visible on desktop navigation",
+          "Docs link is visible on mobile navigation"
+        ],
+        "screenshots": [
+          "desktop-docs-nav.png",
+          "mobile-docs-nav.png"
+        ]
+      }
+    ]
+  }
+}

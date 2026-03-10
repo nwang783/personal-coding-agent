@@ -506,6 +506,109 @@ dt {
   overflow-y: auto;
 }
 
+.artifact-section {
+  gap: 12px;
+}
+
+.artifact-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.artifact-card {
+  display: block;
+  padding: 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  text-decoration: none;
+  box-shadow: var(--shadow);
+}
+
+.artifact-card strong {
+  display: block;
+  margin-top: 10px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.artifact-card p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.artifact-image {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+  border-radius: calc(var(--radius) - 2px);
+  border: 1px solid var(--line);
+  background: #fff;
+}
+
+.artifact-link {
+  display: block;
+  text-decoration: none;
+}
+
+.artifact-text-list {
+  display: grid;
+  gap: 12px;
+}
+
+.artifact-text-card {
+  padding: 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  box-shadow: var(--shadow);
+}
+
+.artifact-text-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.artifact-text-header strong {
+  display: block;
+  font-size: 0.9rem;
+}
+
+.artifact-text-header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.artifact-text-header a {
+  color: var(--accent);
+  font-size: 0.8rem;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.artifact-text-card pre {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  border-radius: calc(var(--radius) - 2px);
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--text);
+  padding: 10px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
 .timeline-entry,
 .trace-item {
   padding: 10px 12px;

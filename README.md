@@ -36,6 +36,9 @@ Spec generation, implementation, and review are dispatcher-based: Pi subagents c
      - real-time streamed events from delegated agents (`stream` mode)
 5. Resume a failed/interrupted task:
    - `/orchestrate-resume <task-id>`
+   - replay from a checkpointed handoff:
+     - `/orchestrate-resume <task-id> --handoff <n>`
+   - use `/orchestrate-log <task-id>` to see numbered handoffs
 6. Stop a running task:
    - `/orchestrate-stop <task-id>`
 
@@ -66,6 +69,138 @@ Running tasks are exposed via live snapshot files written to:
   - `.pi/reports/<task-id>.trace/` (exact subagent prompts/results + per-call meta)
 - Per-task isolated worktrees:
   - `.pi/worktrees/<task-id>/`
+
+## Per-Repo Orchestrator Config
+
+The orchestrator looks for repo config in this order:
+- target repo local config: `<target-repo>/.pi/orchestrator.config.json`
+- central config in this repo: `.pi/repo-configs/<repo-name>.json`
+
+Central config lets you keep orchestrator-specific setup out of product repos. When using central config, add `repoPath` to pin the config to one exact repository path and avoid basename collisions.
+
+Every target repo can still use the local file path. The format is intentionally permissive so repo-specific behavior can grow over time without changing the location again.
+
+Current supported settings:
+- `worktree.defaultMode`
+  - optional, either `"symlink"` or `"copy"`
+  - defaults to `"symlink"`
+- `worktree.sync`
+  - optional array of relative repo paths to materialize into each task worktree after `git worktree add`
+  - entries may be plain strings or objects with `path` and optional `mode`
+- `promptContext.files`
+  - optional array of repo-relative files to preview into delegated prompts
+  - useful for concise runtime guidance files that validators should see without rediscovering them
+- `validation.services`
+  - optional array of local services the validator should start in the active worktree
+  - each service may declare `id`, `name`, `cwd`, `command`, `url`, `ready`, `envFiles`, and `purpose`
+- `validation.demoScenarios`
+  - optional array of browser or runtime scenarios the validator should exercise
+  - each scenario may declare `id`, `name`, `url`, `steps`, `expectedEvidence`, and `screenshots`
+
+Use this for ignored local runtime files that are needed to start dev servers in task worktrees, such as `.env` files.
+
+Example:
+
+```json
+{
+  "repoPath": "/Users/nathanwang/Projects/claw-social",
+  "worktree": {
+    "defaultMode": "symlink",
+    "sync": [
+      "api/.env",
+      "vite-react/.env"
+    ]
+  },
+  "promptContext": {
+    "files": [
+      "README.md",
+      "api/src/app.ts",
+      "vite-react/src/lib/apiBase.ts"
+    ]
+  },
+  "validation": {
+    "services": [
+      {
+        "id": "api",
+        "name": "API",
+        "cwd": "api",
+        "command": "npm run dev",
+        "url": "http://localhost:3001/v1",
+        "ready": { "type": "http", "url": "http://localhost:3001/health" }
+      },
+      {
+        "id": "frontend",
+        "name": "Frontend",
+        "cwd": "vite-react",
+        "command": "npm run dev -- --host localhost --port 5173",
+        "url": "http://localhost:5173",
+        "ready": { "type": "http", "url": "http://localhost:5173" }
+      }
+    ],
+    "demoScenarios": [
+      {
+        "id": "home-page-loads",
+        "name": "Home page loads",
+        "url": "http://localhost:5173",
+        "steps": [
+          "Open the home page in a browser.",
+          "Confirm the page loads without a fatal error screen.",
+          "Capture at least one screenshot."
+        ],
+        "expectedEvidence": [
+          "Home page reachable in browser",
+          "No fatal startup/runtime error on first load"
+        ],
+        "screenshots": ["home.png"]
+      },
+      {
+        "id": "docs-link-visible",
+        "name": "Docs link is visible on landing page",
+        "url": "http://localhost:5173",
+        "steps": [
+          "Open the landing page in desktop and mobile browser sizes.",
+          "Confirm the docs-site/docs navigation link is visible in both layouts.",
+          "Capture desktop and mobile screenshots showing the docs link."
+        ],
+        "expectedEvidence": [
+          "Landing page renders at localhost without CORS errors blocking the main experience",
+          "Docs link is visible on desktop navigation",
+          "Docs link is visible on mobile navigation"
+        ],
+        "screenshots": ["desktop-docs-nav.png", "mobile-docs-nav.png"]
+      }
+    ]
+  }
+}
+```
+
+Behavior:
+- local target-repo config wins over central config when both exist
+- central config is matched by repo basename first, then filtered by optional `repoPath` equality
+- only relative paths inside the target repo are allowed for `worktree.sync`, `promptContext.files`, service `cwd`, and service `envFiles`
+- invalid or missing config entries are skipped and logged
+- missing sync source paths are skipped
+- `symlink` avoids duplicating secrets across worktrees
+- `copy` is available for tools that do not behave well with symlinked env files
+- validator dispatch uses `validation.services` and `validation.demoScenarios` as the primary source of truth when they are present
+- delegated validation prompts include:
+  - the artifact output directory at `.pi/reports/<task-id>.artifacts/`
+  - materialized worktree file summary from `worktree.sync`
+  - prompt-context file previews from `promptContext.files`
+  - startup commands, readiness checks, URLs, and expected demo evidence from `validation`
+- when validation config is absent, the validator falls back to repository docs such as `AGENTS.md` and `README.md`
+
+Example `claw-social` setup:
+- store the config in `.pi/repo-configs/claw-social.json`
+- sync `api/.env` and `vite-react/.env` into each task worktree
+- preview `README.md`, `api/src/app.ts`, and `vite-react/src/lib/apiBase.ts` in delegated validation prompts
+- start:
+  - `api` with `npm run dev`
+  - `vite-react` with `npm run dev -- --host localhost --port 5173`
+- use API readiness at `http://localhost:3001/health`
+- validate the home page at `http://localhost:5173`
+- keep the frontend on `localhost` instead of `127.0.0.1` because the current API dev CORS policy allows `localhost` origins only
+- store screenshots and other demo artifacts under `.pi/reports/<task-id>.artifacts/`
 
 ## GitHub PR requirements
 

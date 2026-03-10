@@ -21,6 +21,54 @@ type FailureKind =
 	| "workflow_bug_reported"
 	| "stopped";
 type WidgetMode = "compact" | "handoff" | "prompt" | "result" | "history" | "stream";
+type WorktreeSyncMode = "copy" | "symlink";
+
+type PromptContextConfig = {
+	files?: string[];
+};
+
+type ValidationReadyCheck = {
+	type: "http";
+	url: string;
+};
+
+type ValidationService = {
+	id: string;
+	name?: string;
+	cwd: string;
+	command: string;
+	url?: string;
+	ready?: ValidationReadyCheck;
+	envFiles?: string[];
+	purpose?: string;
+};
+
+type ValidationScenario = {
+	id: string;
+	name: string;
+	url?: string;
+	steps?: string[];
+	expectedEvidence?: string[];
+	screenshots?: string[];
+};
+
+type ValidationConfig = {
+	services?: ValidationService[];
+	demoScenarios?: ValidationScenario[];
+	artifacts?: {
+		baseSubdir?: string;
+	};
+};
+
+type RepoConfig = {
+	repoPath?: string;
+	worktree?: {
+		sync?: Array<string | { path?: string; mode?: WorktreeSyncMode }>;
+		defaultMode?: WorktreeSyncMode;
+	};
+	promptContext?: PromptContextConfig;
+	validation?: ValidationConfig;
+};
 
 type ReviewFinding = {
 	severity: "P0" | "P1" | "P2" | "P3";
@@ -181,6 +229,10 @@ type TaskState = {
 	lastVerification?: VerificationItem[];
 	lastCiChecks?: CiCheck[];
 	lastArtifacts?: ArtifactBag;
+	worktreeSync?: {
+		synced: string[];
+		missing: string[];
+	};
 	finalReport?: string;
 	history: Array<{ at: string; stage: TaskStage; note: string }>;
 	traceSeq?: number;
@@ -194,6 +246,7 @@ type TaskState = {
 	lastStreamEvent?: string;
 	streamEvents?: Array<{ at: string; agent: string; purpose: string; kind: string; text: string }>;
 	widgetMode?: WidgetMode;
+	stopRequested?: boolean;
 };
 
 type AgentConfig = {
@@ -227,6 +280,9 @@ type SubagentRun = {
 
 const WIDGET_MODES: WidgetMode[] = ["compact", "handoff", "prompt", "result", "history", "stream"];
 const ORCHESTRATOR_EXTENSION_PATH = "/Users/nathanwang/Projects/personal-coding-agent/.pi/extensions/pi-orchestrator/index.ts";
+const REPO_CONFIG_FILE = path.join(".pi", "orchestrator.config.json");
+const ORCHESTRATOR_REPO_ROOT = path.resolve(path.dirname(ORCHESTRATOR_EXTENSION_PATH), "..", "..", "..");
+const CENTRAL_REPO_CONFIGS_DIR = path.join(ORCHESTRATOR_REPO_ROOT, ".pi", "repo-configs");
 
 function nowIso(): string {
 	return new Date().toISOString();
@@ -279,6 +335,32 @@ function parseOrchestrateArgs(
 	return { repoPath, taskInput };
 }
 
+function parseResumeArgs(args: string): { taskId?: string; handoffIndex?: number; error?: string } {
+	const trimmed = args.trim();
+	if (!trimmed) return { error: "Usage: /orchestrate-resume <task-id> [--handoff <n>]" };
+	const parts = trimmed.split(/\s+/).filter(Boolean);
+	const taskId = parts.shift();
+	if (!taskId) return { error: "Usage: /orchestrate-resume <task-id> [--handoff <n>]" };
+
+	let handoffIndex: number | undefined;
+	while (parts.length > 0) {
+		const flag = parts.shift();
+		if (flag === "--handoff") {
+			const raw = parts.shift();
+			if (!raw) return { error: "Usage: /orchestrate-resume <task-id> [--handoff <n>]" };
+			const parsed = Number(raw);
+			if (!Number.isInteger(parsed) || parsed < 0) {
+				return { error: "Handoff index must be a non-negative integer" };
+			}
+			handoffIndex = parsed;
+			continue;
+		}
+		return { error: `Unknown argument: ${flag}` };
+	}
+
+	return { taskId, handoffIndex };
+}
+
 function getSubagentTimeoutMs(): number {
 	const raw = process.env.PI_ORCHESTRATOR_SUBAGENT_TIMEOUT_MS;
 	const parsed = raw ? Number(raw) : NaN;
@@ -300,16 +382,379 @@ function ensureDir(dir: string): void {
 	fs.mkdirSync(dir, { recursive: true });
 }
 
-function writeJsonAtomic(filePath: string, data: unknown): void {
+function ensureParentDir(filePath: string): void {
 	ensureDir(path.dirname(filePath));
+}
+
+function writeJsonAtomic(filePath: string, data: unknown): void {
+	ensureParentDir(filePath);
 	const tmpPath = `${filePath}.tmp`;
 	fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
 	fs.renameSync(tmpPath, filePath);
 }
 
 function appendJsonl(filePath: string, value: EventRecord): void {
-	ensureDir(path.dirname(filePath));
+	ensureParentDir(filePath);
 	fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf-8");
+}
+
+function safeReadJsonFile(filePath: string): unknown {
+	try {
+		return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+	} catch {
+		return undefined;
+	}
+}
+
+function getRepoConfigPath(repoPath: string): string {
+	return path.join(repoPath, REPO_CONFIG_FILE);
+}
+
+function matchesConfiguredRepoPath(configuredRepoPath: string | undefined, repoPath: string): boolean {
+	if (!configuredRepoPath?.trim()) return true;
+	return path.resolve(configuredRepoPath) === path.resolve(repoPath);
+}
+
+function getCentralRepoConfigCandidates(repoPath: string): string[] {
+	if (!fs.existsSync(CENTRAL_REPO_CONFIGS_DIR)) return [];
+	const repoName = path.basename(path.resolve(repoPath));
+	const directMatch = path.join(CENTRAL_REPO_CONFIGS_DIR, `${repoName}.json`);
+	const candidates: string[] = [];
+	if (fs.existsSync(directMatch)) candidates.push(directMatch);
+	for (const entry of fs.readdirSync(CENTRAL_REPO_CONFIGS_DIR, { withFileTypes: true })) {
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		const candidate = path.join(CENTRAL_REPO_CONFIGS_DIR, entry.name);
+		if (candidate === directMatch) continue;
+		candidates.push(candidate);
+	}
+	return candidates;
+}
+
+function loadRepoConfig(repoPath: string): RepoConfig {
+	const configPaths = [getRepoConfigPath(repoPath), ...getCentralRepoConfigCandidates(repoPath)];
+	for (const configPath of configPaths) {
+		const parsed = safeReadJsonFile(configPath);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+		const config = parsed as RepoConfig;
+		if (!matchesConfiguredRepoPath(config.repoPath, repoPath)) continue;
+		return config;
+	}
+	return {};
+}
+
+function isValidWorktreeSyncMode(value: unknown): value is WorktreeSyncMode {
+	return value === "copy" || value === "symlink";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function resolveRelativeRepoPath(repoPath: string, relativePath: string): string | undefined {
+	if (!relativePath.trim()) return undefined;
+	if (path.isAbsolute(relativePath)) return undefined;
+	const resolved = path.resolve(repoPath, relativePath);
+	const repoRoot = path.resolve(repoPath);
+	return resolved === repoRoot || resolved.startsWith(`${repoRoot}${path.sep}`) ? resolved : undefined;
+}
+
+function normalizeWorktreeSyncEntries(repoPath: string): {
+	entries: Array<{ relativePath: string; mode: WorktreeSyncMode }>;
+	skipped: string[];
+} {
+	const config = loadRepoConfig(repoPath);
+	const defaultMode = isValidWorktreeSyncMode(config.worktree?.defaultMode) ? config.worktree?.defaultMode : "symlink";
+	const syncEntries = config.worktree?.sync;
+	if (!Array.isArray(syncEntries)) return { entries: [], skipped: [] };
+
+	const normalized: Array<{ relativePath: string; mode: WorktreeSyncMode }> = [];
+	const skipped: string[] = [];
+	for (const entry of syncEntries) {
+		const relativePath =
+			typeof entry === "string" ? entry.trim()
+			: typeof entry?.path === "string" ? entry.path.trim()
+			: "";
+		if (!relativePath) continue;
+		if (path.isAbsolute(relativePath)) {
+			skipped.push(`${relativePath} (absolute path)`);
+			continue;
+		}
+		const entryMode = typeof entry === "string" ? undefined : entry.mode;
+		const mode = isValidWorktreeSyncMode(entryMode) ? entryMode : defaultMode;
+		if (!resolveRelativeRepoPath(repoPath, relativePath)) {
+			skipped.push(`${relativePath} (invalid path)`);
+			continue;
+		}
+		normalized.push({ relativePath, mode });
+	}
+	return { entries: normalized, skipped };
+}
+
+function normalizePromptContextFiles(repoPath: string): { files: string[]; skipped: string[] } {
+	const config = loadRepoConfig(repoPath);
+	const rawFiles = config.promptContext?.files;
+	if (!Array.isArray(rawFiles)) return { files: [], skipped: [] };
+
+	const files: string[] = [];
+	const skipped: string[] = [];
+	for (const entry of rawFiles) {
+		const relativePath = typeof entry === "string" ? entry.trim() : "";
+		if (!relativePath) continue;
+		const resolved = resolveRelativeRepoPath(repoPath, relativePath);
+		if (!resolved) {
+			skipped.push(`${relativePath} (invalid path)`);
+			continue;
+		}
+		if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+			skipped.push(`${relativePath} (missing file)`);
+			continue;
+		}
+		files.push(relativePath);
+	}
+	return { files, skipped };
+}
+
+function normalizeValidationReadyCheck(value: unknown): ValidationReadyCheck | undefined {
+	if (!isRecord(value) || value.type !== "http" || typeof value.url !== "string") return undefined;
+	const url = value.url.trim();
+	if (!url) return undefined;
+	return { type: "http", url };
+}
+
+function normalizeValidationServices(repoPath: string): { services: ValidationService[]; skipped: string[] } {
+	const config = loadRepoConfig(repoPath);
+	const rawServices = config.validation?.services;
+	if (!Array.isArray(rawServices)) return { services: [], skipped: [] };
+
+	const services: ValidationService[] = [];
+	const skipped: string[] = [];
+	for (const entry of rawServices) {
+		if (!isRecord(entry)) {
+			skipped.push("(invalid service entry)");
+			continue;
+		}
+		const id = typeof entry.id === "string" ? entry.id.trim() : "";
+		const cwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
+		const command = typeof entry.command === "string" ? entry.command.trim() : "";
+		if (!id || !cwd || !command) {
+			skipped.push(id || cwd || "(missing id/cwd/command)");
+			continue;
+		}
+		if (!resolveRelativeRepoPath(repoPath, cwd)) {
+			skipped.push(`${id} (invalid cwd)`);
+			continue;
+		}
+		const envFiles = Array.isArray(entry.envFiles)
+			? entry.envFiles
+				.filter((file): file is string => typeof file === "string")
+				.map((file) => file.trim())
+				.filter(Boolean)
+				.filter((file) => {
+					const valid = Boolean(resolveRelativeRepoPath(repoPath, file));
+					if (!valid) skipped.push(`${id}: envFiles ${file} (invalid path)`);
+					return valid;
+				})
+			: undefined;
+		services.push({
+			id,
+			name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : undefined,
+			cwd,
+			command,
+			url: typeof entry.url === "string" && entry.url.trim() ? entry.url.trim() : undefined,
+			ready: normalizeValidationReadyCheck(entry.ready),
+			envFiles,
+			purpose: typeof entry.purpose === "string" && entry.purpose.trim() ? entry.purpose.trim() : undefined,
+		});
+	}
+	return { services, skipped };
+}
+
+function normalizeValidationScenarios(repoPath: string): { scenarios: ValidationScenario[]; skipped: string[] } {
+	const config = loadRepoConfig(repoPath);
+	const rawScenarios = config.validation?.demoScenarios;
+	if (!Array.isArray(rawScenarios)) return { scenarios: [], skipped: [] };
+
+	const scenarios: ValidationScenario[] = [];
+	const skipped: string[] = [];
+	for (const entry of rawScenarios) {
+		if (!isRecord(entry)) {
+			skipped.push("(invalid scenario entry)");
+			continue;
+		}
+		const id = typeof entry.id === "string" ? entry.id.trim() : "";
+		const name = typeof entry.name === "string" ? entry.name.trim() : "";
+		if (!id || !name) {
+			skipped.push(id || name || "(missing id/name)");
+			continue;
+		}
+		scenarios.push({
+			id,
+			name,
+			url: typeof entry.url === "string" && entry.url.trim() ? entry.url.trim() : undefined,
+			steps: Array.isArray(entry.steps)
+				? entry.steps.filter((step): step is string => typeof step === "string").map((step) => step.trim()).filter(Boolean)
+				: undefined,
+			expectedEvidence: Array.isArray(entry.expectedEvidence)
+				? entry.expectedEvidence
+					.filter((item): item is string => typeof item === "string")
+					.map((item) => item.trim())
+					.filter(Boolean)
+				: undefined,
+			screenshots: Array.isArray(entry.screenshots)
+				? entry.screenshots
+					.filter((item): item is string => typeof item === "string")
+					.map((item) => item.trim())
+					.filter(Boolean)
+				: undefined,
+		});
+	}
+	return { scenarios, skipped };
+}
+
+function getValidationArtifactDir(state: TaskState): string {
+	const reportsDir = path.join(state.repoPath, ".pi", "reports");
+	return path.join(reportsDir, `${safeFilename(state.id)}.artifacts`);
+}
+
+function previewPromptContextFile(repoPath: string, relativePath: string): string | undefined {
+	const filePath = resolveRelativeRepoPath(repoPath, relativePath);
+	if (!filePath || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return undefined;
+	const maxBytes = 8 * 1024;
+	const maxLines = 80;
+	const raw = fs.readFileSync(filePath, "utf-8").slice(0, maxBytes);
+	return raw.split("\n").slice(0, maxLines).join("\n").trim();
+}
+
+function formatPromptContextSection(repoPath: string): string[] {
+	const { files, skipped } = normalizePromptContextFiles(repoPath);
+	for (const item of skipped) {
+		console.log(`[pi-orchestrator] skipped promptContext.files entry: ${item}`);
+	}
+	if (files.length === 0) return [];
+	const lines = ["Configured prompt context files:"];
+	for (const relativePath of files) {
+		const preview = previewPromptContextFile(repoPath, relativePath);
+		if (!preview) continue;
+		lines.push("", `File: ${relativePath}`, "```", preview, "```");
+	}
+	return lines;
+}
+
+function formatValidationConfigSection(state: TaskState): string[] {
+	const { services, skipped: skippedServices } = normalizeValidationServices(state.repoPath);
+	const { scenarios, skipped: skippedScenarios } = normalizeValidationScenarios(state.repoPath);
+	for (const item of [...skippedServices, ...skippedScenarios]) {
+		console.log(`[pi-orchestrator] skipped validation config entry: ${item}`);
+	}
+	const promptContextLines = formatPromptContextSection(state.repoPath);
+	if (services.length === 0 && scenarios.length === 0 && promptContextLines.length === 0) return [];
+
+	const lines = [
+		"Configured validation runtime:",
+		`- Artifact output directory: ${getValidationArtifactDir(state)}`,
+	];
+	const synced = state.worktreeSync?.synced ?? [];
+	const missing = state.worktreeSync?.missing ?? [];
+	if (synced.length > 0) {
+		lines.push("- Materialized worktree files:");
+		for (const item of synced) lines.push(`  - ${item}`);
+	}
+	if (missing.length > 0) {
+		lines.push("- Missing configured worktree files:");
+		for (const item of missing) lines.push(`  - ${item}`);
+	}
+	if (services.length > 0) {
+		lines.push("", "Configured services:");
+		for (const service of services) {
+			lines.push(`- ${service.name ?? service.id} (${service.id})`);
+			lines.push(`  - cwd: ${service.cwd}`);
+			lines.push(`  - command: ${service.command}`);
+			if (service.url) lines.push(`  - url: ${service.url}`);
+			if (service.ready?.type === "http") lines.push(`  - readiness: HTTP ${service.ready.url}`);
+			if (service.envFiles && service.envFiles.length > 0) lines.push(`  - env files: ${service.envFiles.join(", ")}`);
+			if (service.purpose) lines.push(`  - purpose: ${service.purpose}`);
+		}
+	}
+	if (scenarios.length > 0) {
+		lines.push("", "Configured demo scenarios:");
+		for (const scenario of scenarios) {
+			lines.push(`- ${scenario.name} (${scenario.id})`);
+			if (scenario.url) lines.push(`  - url: ${scenario.url}`);
+			if (scenario.steps && scenario.steps.length > 0) {
+				lines.push("  - steps:");
+				for (const step of scenario.steps) lines.push(`    - ${step}`);
+			}
+			if (scenario.expectedEvidence && scenario.expectedEvidence.length > 0) {
+				lines.push("  - expected evidence:");
+				for (const item of scenario.expectedEvidence) lines.push(`    - ${item}`);
+			}
+			if (scenario.screenshots && scenario.screenshots.length > 0) {
+				lines.push(`  - screenshots: ${scenario.screenshots.join(", ")}`);
+			}
+		}
+	}
+	if (promptContextLines.length > 0) {
+		lines.push("", ...promptContextLines);
+	}
+	lines.push(
+		"",
+		"Validation execution requirements:",
+		"- Start configured services from the active worktree only.",
+		"- Wait for each service using the configured readiness check before validating.",
+		"- Use configured scenario URLs instead of guessing when they are provided.",
+		"- Use Playwright for browser validation when a browser-facing URL is configured.",
+		"- Save screenshots and logs into the artifact output directory.",
+		"- Return concrete evidence: commands run, readiness results, URLs used, screenshots/logs captured, observed outcomes, and failures.",
+	);
+	return lines;
+}
+
+function recreateSymlink(targetPath: string, linkPath: string): void {
+	const stat = fs.existsSync(linkPath) ? fs.lstatSync(linkPath) : undefined;
+	if (stat) fs.rmSync(linkPath, { recursive: true, force: true });
+	ensureParentDir(linkPath);
+	const targetStat = fs.lstatSync(targetPath);
+	const linkType: fs.symlink.Type | undefined = targetStat.isDirectory() ? "dir" : "file";
+	fs.symlinkSync(targetPath, linkPath, linkType);
+}
+
+function syncPathIntoWorktree(
+	repoPath: string,
+	worktreePath: string,
+	relativePath: string,
+	mode: WorktreeSyncMode,
+): { status: "synced" | "missing"; details: string } {
+	const sourcePath = resolveRelativeRepoPath(repoPath, relativePath);
+	const destinationPath = resolveRelativeRepoPath(worktreePath, relativePath);
+	if (!sourcePath || !destinationPath) {
+		return { status: "missing", details: `${relativePath} (invalid path)` };
+	}
+	if (!fs.existsSync(sourcePath)) {
+		return { status: "missing", details: relativePath };
+	}
+	if (mode === "copy") {
+		fs.rmSync(destinationPath, { recursive: true, force: true });
+		ensureParentDir(destinationPath);
+		fs.cpSync(sourcePath, destinationPath, { recursive: true, force: true });
+		return { status: "synced", details: `${relativePath} (copy)` };
+	}
+	recreateSymlink(sourcePath, destinationPath);
+	return { status: "synced", details: `${relativePath} (symlink)` };
+}
+
+function syncConfiguredWorktreePaths(repoPath: string, worktreePath: string): { synced: string[]; missing: string[] } {
+	const synced: string[] = [];
+	const missing: string[] = [];
+	const { entries, skipped } = normalizeWorktreeSyncEntries(repoPath);
+	for (const item of skipped) {
+		console.log(`[pi-orchestrator] skipped worktree.sync entry: ${item}`);
+	}
+	for (const entry of entries) {
+		const result = syncPathIntoWorktree(repoPath, worktreePath, entry.relativePath, entry.mode);
+		if (result.status === "synced") synced.push(result.details);
+		else missing.push(result.details);
+	}
+	return { synced, missing };
 }
 
 function parseFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
@@ -330,6 +775,22 @@ function parseFrontmatter(content: string): { frontmatter: Record<string, string
 		frontmatter[key] = value;
 	}
 	return { frontmatter, body };
+}
+
+function extractFinalSummary(text: string, maxChars = 1200): string {
+	const normalized = text.replace(/\r\n/g, "\n").trim();
+	if (!normalized) return "(empty)";
+	const summaryMatch = normalized.match(/(?:^|\n)#{1,6}\s*summary\s*\n([\s\S]*?)(?=\n#{1,6}\s+\S|\s*$)/i);
+	const summaryBlock = summaryMatch?.[1]?.trim();
+	const source = summaryBlock && summaryBlock.length > 0 ? summaryBlock : normalized;
+	const compact = source
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.filter((line) => !line.startsWith("```"))
+		.join("\n");
+	if (!compact) return "(empty)";
+	return compact.length <= maxChars ? compact : `${compact.slice(0, maxChars - 1).trimEnd()}...`;
 }
 
 function loadProjectAgents(cwd: string): Map<string, AgentConfig> {
@@ -708,6 +1169,14 @@ async function ensureTaskWorktree(pi: ExtensionAPI, state: TaskState): Promise<v
 	if (branchResult.code === 0 && branchResult.stdout.trim()) {
 		state.worktreeBranch = branchResult.stdout.trim();
 	}
+	const syncResult = syncConfiguredWorktreePaths(state.repoPath, state.worktreePath);
+	state.worktreeSync = syncResult;
+	if (syncResult.synced.length > 0) {
+		console.log(`[pi-orchestrator] synced worktree paths for ${state.id}: ${syncResult.synced.join(", ")}`);
+	}
+	if (syncResult.missing.length > 0) {
+		console.log(`[pi-orchestrator] skipped missing worktree sync paths for ${state.id}: ${syncResult.missing.join(", ")}`);
+	}
 }
 
 function validateToolSignal(fromAgent: RuntimeAgent, signal: ToolSignal): string | undefined {
@@ -871,6 +1340,7 @@ type DispatchCodingResult = {
 	exitCode: number;
 	timedOut: boolean;
 	durationMs: number;
+	finalSummary: string;
 	finalAssistantText: string;
 	fullAssistantText: string;
 	stderr: string;
@@ -934,6 +1404,7 @@ async function dispatchCodingRun(
 	const promptPath = path.join(traceDir, `${stem}.delegated.prompt.md`);
 	const resultPath = path.join(traceDir, `${stem}.delegated.result.md`);
 	const progress = readProgress(state);
+	const validationContext = taskKind === "validation" ? formatValidationConfigSection(state) : [];
 	const fullPrompt = [
 		`Repository root path: ${state.repoPath}`,
 		`Active worktree path: ${state.worktreePath ?? state.repoPath}`,
@@ -941,6 +1412,15 @@ async function dispatchCodingRun(
 		"All edits and git actions must happen only in the active worktree path.",
 		"Do not inspect or modify sibling repos or any other checkout on disk.",
 		"",
+		...(validationContext.length > 0 ? [...validationContext, ""] : []),
+		...(taskKind === "validation" && validationContext.length === 0
+			? [
+					"Validation workflow fallback:",
+					"- No repo-specific validation config was provided.",
+					"- Discover the local startup and test workflow from AGENTS.md and/or README.md before making assumptions.",
+					"",
+				]
+			: []),
 		"Current run progress:",
 		progress.trim(),
 		"",
@@ -957,8 +1437,6 @@ async function dispatchCodingRun(
 			? resumeSessionId
 				? [
 						"exec",
-						"resume",
-						resumeSessionId,
 						"--model",
 						CODEX_MODEL,
 						"--config",
@@ -966,6 +1444,8 @@ async function dispatchCodingRun(
 						"--dangerously-bypass-approvals-and-sandbox",
 						"--skip-git-repo-check",
 						"--json",
+						"resume",
+						resumeSessionId,
 						"-",
 					]
 				: [
@@ -1038,6 +1518,7 @@ async function dispatchCodingRun(
 		}
 		if (messages.length > 0) finalAssistantText = messages[messages.length - 1];
 	}
+	const finalSummary = extractFinalSummary(finalAssistantText || output || result.stderr || "");
 	return {
 		ok: result.code === 0 && !result.timedOut,
 		provider,
@@ -1045,6 +1526,7 @@ async function dispatchCodingRun(
 		exitCode: result.code,
 		timedOut: result.timedOut,
 		durationMs: Date.now() - started,
+		finalSummary,
 		finalAssistantText: finalAssistantText || "(empty)",
 		fullAssistantText: output || "(empty)",
 		stderr: result.stderr.trim(),
@@ -1052,6 +1534,82 @@ async function dispatchCodingRun(
 		promptPath,
 		resultPath,
 	};
+}
+
+async function runToolGit(
+	pi: ExtensionAPI,
+	state: TaskState,
+	args: string[],
+): Promise<{ code: number; stdout: string; stderr: string }> {
+	if (!state.worktreePath || !fs.existsSync(state.worktreePath)) {
+		throw new Error("Task worktree is unavailable");
+	}
+	return pi.exec("git", ["-C", state.worktreePath, ...args], { timeout: 120_000 });
+}
+
+async function runToolGh(
+	pi: ExtensionAPI,
+	state: TaskState,
+	args: string[],
+): Promise<{ code: number; stdout: string; stderr: string }> {
+	if (!state.worktreePath || !fs.existsSync(state.worktreePath)) {
+		throw new Error("Task worktree is unavailable");
+	}
+	return pi.exec("gh", args, { cwd: state.worktreePath, timeout: 120_000 });
+}
+
+async function openPullRequestForTask(
+	pi: ExtensionAPI,
+	state: TaskState,
+	title: string,
+	body: string,
+): Promise<{ ok: boolean; prUrl?: string; branch?: string; existing?: boolean; error?: string }> {
+	const branchResult = await runToolGit(pi, state, ["branch", "--show-current"]);
+	const branch = branchResult.code === 0 ? branchResult.stdout.trim() : "";
+	if (!branch) {
+		return { ok: false, error: branchResult.stderr.trim() || "No active branch in task worktree" };
+	}
+
+	const existingPr = await runToolGh(pi, state, ["pr", "view", "--json", "url"]);
+	if (existingPr.code === 0) {
+		try {
+			const parsed = JSON.parse(existingPr.stdout.trim()) as { url?: string };
+			if (parsed.url) {
+				state.lastBranchName = branch;
+				state.lastPrUrl = parsed.url;
+				state.lastPrFailureReason = undefined;
+				return { ok: true, prUrl: parsed.url, branch, existing: true };
+			}
+		} catch {
+			// ignore malformed gh output and attempt create below
+		}
+	}
+
+	const pushResult = await runToolGit(pi, state, ["push", "-u", "origin", branch]);
+	if (pushResult.code !== 0) {
+		state.lastPrFailureReason = pushResult.stderr.trim() || "Unable to push branch before opening PR";
+		return { ok: false, error: state.lastPrFailureReason };
+	}
+
+	const createResult = await runToolGh(pi, state, ["pr", "create", "--title", title, "--body", body]);
+	if (createResult.code !== 0) {
+		state.lastPrFailureReason = createResult.stderr.trim() || "Unable to open PR";
+		return { ok: false, error: state.lastPrFailureReason };
+	}
+
+	const prUrl = createResult.stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => line.startsWith("http"));
+	if (!prUrl) {
+		state.lastPrFailureReason = "gh pr create did not return a PR URL";
+		return { ok: false, error: state.lastPrFailureReason };
+	}
+
+	state.lastBranchName = branch;
+	state.lastPrUrl = prUrl;
+	state.lastPrFailureReason = undefined;
+	return { ok: true, prUrl, branch, existing: false };
 }
 
 async function runSubagent(
@@ -1070,6 +1628,10 @@ async function runSubagent(
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 	let promptFile: string | undefined;
 	let timedOut = false;
+	let childRef: ReturnType<typeof spawn> | undefined;
+	let timeoutRef: ReturnType<typeof setTimeout> | undefined;
+	let forcedKillRef: ReturnType<typeof setTimeout> | undefined;
+	let terminalSignalObserved = false;
 	try {
 		if (agent.systemPrompt.trim()) {
 			const tempDir = path.join(repoRootPath, ".pi", "tmp");
@@ -1107,6 +1669,18 @@ async function runSubagent(
 		let pendingDelta = "";
 		let stdoutBuffer = "";
 		let stopRequested = false;
+		const clearTimeoutRef = (): void => {
+			if (!timeoutRef) return;
+			clearTimeout(timeoutRef);
+			timeoutRef = undefined;
+		};
+		const requestChildShutdown = (): void => {
+			if (!childRef || childRef.killed) return;
+			clearTimeoutRef();
+			childRef.kill("SIGTERM");
+			if (forcedKillRef) clearTimeout(forcedKillRef);
+			forcedKillRef = setTimeout(() => childRef?.kill("SIGKILL"), 5_000);
+		};
 		const flushDelta = (): void => {
 			const text = pendingDelta.trim();
 			if (!text) return;
@@ -1152,9 +1726,13 @@ async function runSubagent(
 					if (!event.isError && pending) {
 						if (toolName === "handoff") {
 							toolSignals.push({ kind: "handoff", payload: parseHandoffPayload(pending.args) });
+							terminalSignalObserved = true;
+							requestChildShutdown();
 						}
 						if (toolName === "finish") {
 							toolSignals.push({ kind: "finish", payload: parseFinishPayload(pending.args) });
+							terminalSignalObserved = true;
+							requestChildShutdown();
 						}
 						if (toolName === "report_bug_in_workflow") {
 							toolSignals.push({ kind: "workflow_bug", payload: parseWorkflowBugPayload(pending.args) });
@@ -1200,6 +1778,7 @@ async function runSubagent(
 					PI_ORCHESTRATOR_WORKTREE_PATH: worktreePath,
 				},
 			});
+			childRef = child;
 			let done = false;
 			const complete = (code: number, err: string): void => {
 				if (done) return;
@@ -1210,14 +1789,12 @@ async function runSubagent(
 				if (stopRequested || !fs.existsSync(stopRequestPath)) return;
 				stopRequested = true;
 				onStreamEvent?.("stop_requested", "stop request received; terminating subagent");
-				child.kill("SIGTERM");
-				setTimeout(() => child.kill("SIGKILL"), 5_000);
+				requestChildShutdown();
 			};
-			const timeout = setTimeout(() => {
+			timeoutRef = setTimeout(() => {
 				timedOut = true;
 				onStreamEvent?.("timeout", `subagent exceeded timeout after ${Math.floor(timeoutMs / 1000)}s`);
-				child.kill("SIGTERM");
-				setTimeout(() => child.kill("SIGKILL"), 5_000);
+				requestChildShutdown();
 			}, timeoutMs);
 			const stopPoll = setInterval(maybeStop, 1000);
 			child.stdout.on("data", (chunk) => {
@@ -1236,12 +1813,14 @@ async function runSubagent(
 				stderr += chunk.toString("utf-8");
 			});
 			child.on("error", (error) => {
-				clearTimeout(timeout);
+				clearTimeoutRef();
+				if (forcedKillRef) clearTimeout(forcedKillRef);
 				clearInterval(stopPoll);
 				complete(1, `${stderr}\n${error.message}`.trim());
 			});
 			child.on("close", (code) => {
-				clearTimeout(timeout);
+				clearTimeoutRef();
+				if (forcedKillRef) clearTimeout(forcedKillRef);
 				clearInterval(stopPoll);
 				if (stdoutBuffer.trim()) parseLine(stdoutBuffer.trim());
 				flushDelta();
@@ -1249,7 +1828,7 @@ async function runSubagent(
 			});
 		});
 		return {
-			ok: result.code === 0,
+			ok: (result.code === 0 && !timedOut) || terminalSignalObserved,
 			exitCode: result.code,
 			stderr: result.stderr || stderr.trim(),
 			finalAssistantText,
@@ -1468,10 +2047,20 @@ async function runWorkflow(
 		if (run.stopRequested) {
 			return failTask("stopped", "Stop requested by user", currentAgent);
 		}
-		if (!run.ok) {
-			return failTask(run.timedOut ? "timeout" : "subprocess_error", run.stderr || `Agent ${currentAgent} failed`, currentAgent);
-		}
 		const resolvedSignal = resolveToolSignal(currentAgent, run.toolSignals);
+		if (!resolvedSignal.signal) {
+			if (!run.ok) {
+				return failTask(run.timedOut ? "timeout" : "subprocess_error", run.stderr || `Agent ${currentAgent} failed`, currentAgent);
+			}
+		} else if (!run.ok) {
+			recordProgress(
+				pi,
+				ctx,
+				state,
+				getStageForAgent(currentAgent),
+				`Agent ${currentAgent} exited after emitting ${resolvedSignal.signal.kind}; honoring terminal signal`,
+			);
+		}
 		if (resolvedSignal.error) {
 			return failTask("protocol_violation", resolvedSignal.error, currentAgent);
 		}
@@ -1559,6 +2148,69 @@ function summarizeState(state: TaskState): string {
 		state.lastHandoff ? `Last handoff: ${state.lastHandoff.fromAgent} -> ${state.lastHandoff.toAgent}` : undefined,
 		state.failureKind ? `Failure: ${state.failureKind} ${state.failureDetails ?? ""}` : undefined,
 	].filter(Boolean).join("\n");
+}
+
+function getResumeCheckpoint(
+	task: TaskState,
+	handoffIndex: number,
+): { agent: RuntimeAgent; message: string; summary: string; purpose: string; lastHandoff?: HandoffRecord } | { error: string } {
+	if (handoffIndex === 0) {
+		return {
+			agent: "spec-writer",
+			message: [
+				"You are the first stage in the orchestration chain.",
+				"Create the implementation brief, choose codex-impl or amp-impl, and hand off to that implementer.",
+				"",
+				`Repository root path:\n${task.repoPath}`,
+				`Worktree path:\n${task.worktreePath}`,
+				`User task:\n${task.originalTask}`,
+			].join("\n"),
+			summary: "Restart from initial spec handoff",
+			purpose: "agent-runtime",
+		};
+	}
+	const handoff = task.handoffHistory[handoffIndex - 1];
+	if (!handoff) {
+		return { error: `Task has ${task.handoffHistory.length} recorded handoffs; cannot resume from #${handoffIndex}` };
+	}
+	return {
+		agent: handoff.toAgent,
+		message: handoff.message,
+		summary: `Resume from handoff #${handoffIndex}: ${handoff.fromAgent} -> ${handoff.toAgent}`,
+		purpose: `${handoff.fromAgent}-handoff`,
+		lastHandoff: handoff,
+	};
+}
+
+function prepareTaskForResume(task: TaskState, handoffIndex?: number): { summary: string } | { error: string } {
+	task.status = "queued";
+	task.stopRequested = false;
+	task.failureKind = undefined;
+	task.failureDetails = undefined;
+	task.finalReport = undefined;
+	task.stage = "received";
+
+	if (handoffIndex === undefined) {
+		return { summary: "Task resumed by /orchestrate-resume" };
+	}
+
+	const checkpoint = getResumeCheckpoint(task, handoffIndex);
+	if ("error" in checkpoint) return checkpoint;
+
+	task.currentAgent = checkpoint.agent;
+	task.lastHandoff = checkpoint.lastHandoff;
+	task.reviewLoops = 0;
+	task.validationLoops = 0;
+	task.lastPromptPath = undefined;
+	task.lastResultPath = undefined;
+	task.lastDispatchPromptPath = undefined;
+	task.lastDispatchResultPath = undefined;
+	task.activeAgentName = undefined;
+	task.activeAgentPurpose = undefined;
+	task.lastStreamEvent = undefined;
+	task.streamEvents = [];
+
+	return { summary: checkpoint.summary };
 }
 
 function loadPersistedTasks(ctx: ExtensionContext): Map<string, TaskState> {
@@ -1700,6 +2352,11 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 							`Result: ${result.resultPath}`,
 							`Session: ${result.sessionId ?? "n/a"}`,
 							"",
+							"This tool response is the delegated result summary. Use it directly; do not dispatch another run just to read the result file.",
+							"",
+							"Final summary:",
+							result.finalSummary,
+							"",
 							"Final assistant text:",
 							result.finalAssistantText,
 						].join("\n"),
@@ -1714,6 +2371,8 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 					promptPath: result.promptPath,
 					resultPath: result.resultPath,
 					sessionId: result.sessionId,
+					finalSummary: result.finalSummary,
+					finalAssistantText: result.finalAssistantText,
 				},
 			};
 		},
@@ -1740,6 +2399,63 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 			return {
 				content: [{ type: "text", text: `Progress updated in ${getProgressPath(state.repoPath, state)}` }],
 				details: { action: "append_progress" },
+			};
+		},
+	});
+	pi.registerTool({
+		name: "open_pull_request",
+		label: "open_pull_request",
+		description: "Push the current worktree branch if needed and open or reuse a GitHub pull request.",
+		promptSnippet: "Call open_pull_request(title?, body?) after successful validation when no PR URL is available yet.",
+		promptGuidelines: [
+			"Use this after validation succeeds if the delegated result did not already produce a PR URL.",
+			"Do not call this before the branch contains the validated code changes.",
+			"The tool will reuse an existing PR when one already exists for the current branch.",
+		],
+		parameters: Type.Object({
+			title: Type.Optional(Type.String({ description: "PR title. Defaults to the task title." })),
+			body: Type.Optional(Type.String({ description: "PR body. Defaults to task summary plus current final report if available." })),
+		}),
+		async execute(_toolCallId: string, params: unknown) {
+			const activeAgent = process.env.PI_ORCHESTRATOR_ACTIVE_AGENT as RuntimeAgent | undefined;
+			if (!activeAgent) throw new Error("open_pull_request is only available inside an orchestrator stage");
+			if (activeAgent !== "validator" && activeAgent !== "reporter") {
+				throw new Error(`${activeAgent} cannot call open_pull_request`);
+			}
+			const state = loadToolTaskState();
+			const { title, body } = (params ?? {}) as { title?: string; body?: string };
+			const prTitle = title?.trim() || state.title.replace(/^"|"$/g, "");
+			const prBody =
+				body?.trim() ||
+				[
+					"## Summary",
+					state.originalTask,
+					"",
+					"## Validation",
+					state.finalReport?.trim() || "Validated in orchestrator run.",
+				].join("\n");
+			const result = await openPullRequestForTask(pi, state, prTitle, prBody);
+			persistToolTaskState(state);
+			if (!result.ok) {
+				throw new Error(result.error ?? "Unable to open pull request");
+			}
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`${result.existing ? "Using existing" : "Opened"} pull request.`,
+							`Branch: ${result.branch ?? state.lastBranchName ?? "n/a"}`,
+							`PR: ${result.prUrl ?? state.lastPrUrl ?? "n/a"}`,
+						].join("\n"),
+					},
+				],
+				details: {
+					action: "open_pull_request",
+					prUrl: result.prUrl ?? state.lastPrUrl,
+					branch: result.branch ?? state.lastBranchName,
+					existing: result.existing ?? false,
+				},
 			};
 		},
 	});
@@ -1926,6 +2642,14 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 			const lines = [
 				summarizeState(task),
 				"",
+				"Handoffs:",
+				...(task.handoffHistory.length > 0
+					? task.handoffHistory.map(
+							(handoff, index) => `#${index + 1} | ${handoff.at} | ${handoff.fromAgent} -> ${handoff.toAgent} | ${handoff.summary}`,
+						)
+					: ["(none)"]),
+				"",
+				"History:",
 				...task.history.map((entry) => `${entry.at} | ${entry.stage} | ${entry.note}`),
 			];
 			ctx.ui.notify(lines.join("\n"), "info");
@@ -1972,24 +2696,33 @@ export default function piOrchestratorExtension(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerCommand("orchestrate-resume", {
-		description: "Resume a failed/interrupted task: /orchestrate-resume <task-id>",
+		description: "Resume a task, optionally from a prior handoff: /orchestrate-resume <task-id> [--handoff <n>]",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const taskId = args.trim();
-			if (!taskId) {
-				ctx.ui.notify("Usage: /orchestrate-resume <task-id>", "warning");
+			const parsed = parseResumeArgs(args);
+			if (parsed.error || !parsed.taskId) {
+				ctx.ui.notify(parsed.error ?? "Usage: /orchestrate-resume <task-id> [--handoff <n>]", "warning");
 				return;
 			}
-			const task = loadTaskById(ctx, taskId);
+			const task = loadTaskById(ctx, parsed.taskId);
 			if (!task) {
-				ctx.ui.notify(`Task not found: ${taskId}`, "error");
+				ctx.ui.notify(`Task not found: ${parsed.taskId}`, "error");
 				return;
 			}
-			if (task.status === "completed") {
-				ctx.ui.notify(`Task ${taskId} is already completed`, "info");
+			if (task.status === "running") {
+				ctx.ui.notify(`Task ${parsed.taskId} is already running`, "warning");
+				return;
+			}
+			if (task.status === "completed" && parsed.handoffIndex === undefined) {
+				ctx.ui.notify(`Task ${parsed.taskId} is already completed. Use --handoff <n> to replay from a checkpoint.`, "info");
+				return;
+			}
+			const prepared = prepareTaskForResume(task, parsed.handoffIndex);
+			if ("error" in prepared) {
+				ctx.ui.notify(prepared.error, "error");
 				return;
 			}
 			const agents = loadProjectAgents(ctx.cwd);
-			recordProgress(pi, ctx, task, "received", "Task resumed by /orchestrate-resume");
+			recordProgress(pi, ctx, task, "received", prepared.summary);
 			try {
 				await runWorkflow(pi, ctx, task, agents);
 					ctx.ui.notify(`Task ${task.id} ${task.status}`, "info");

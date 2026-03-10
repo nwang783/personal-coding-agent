@@ -131,6 +131,10 @@ function App() {
   const progressEntries = selectedTask?.progressEntries ?? [];
   const dispatchHistory = selectedTask?.dispatchHistory ?? [];
   const traceFiles = detail?.traceFiles ?? [];
+  const artifactFiles = detail?.artifactFiles ?? [];
+  const imageArtifacts = artifactFiles.filter((file) => file.kind === "image");
+  const textArtifacts = artifactFiles.filter((file) => file.kind === "text");
+  const otherArtifacts = artifactFiles.filter((file) => file.kind === "other");
 
   useEffect(() => {
     if (!selectedTask) return;
@@ -540,6 +544,73 @@ function App() {
               )}
             </article>
           ) : null}
+        </section>
+
+        <section className="panel" style={{ marginBottom: 16 }}>
+          <div className="panel-header">
+            <h3>Validation artifacts</h3>
+            <span>{artifactFiles.length} files</span>
+          </div>
+          {artifactFiles.length > 0 ? (
+            <div className="stack artifact-section">
+              {imageArtifacts.length > 0 ? (
+                <div className="artifact-gallery">
+                  {imageArtifacts.map((file) => (
+                    <a
+                      key={file.path}
+                      className="artifact-card"
+                      href={file.url}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      <img alt={file.relativePath} className="artifact-image" loading="lazy" src={file.url} />
+                      <strong>{file.name}</strong>
+                      <p>{file.relativePath}</p>
+                    </a>
+                  ))}
+                </div>
+              ) : null}
+
+              {otherArtifacts.length > 0 ? (
+                <div className="trace-list">
+                  {otherArtifacts.map((file) => (
+                    <a
+                      key={file.path}
+                      className="trace-item artifact-link"
+                      href={file.url}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      <span className="pill trace other">{file.kind}</span>
+                      <strong>{file.name}</strong>
+                      <p>{file.relativePath}</p>
+                    </a>
+                  ))}
+                </div>
+              ) : null}
+
+              {textArtifacts.length > 0 ? (
+                <div className="artifact-text-list">
+                  {textArtifacts.map((file) => (
+                    <article key={file.path} className="artifact-text-card">
+                      <div className="artifact-text-header">
+                        <div>
+                          <strong>{file.name}</strong>
+                          <p>{file.relativePath}</p>
+                        </div>
+                        <a href={file.url} rel="noreferrer" target="_blank">
+                          Open
+                        </a>
+                      </div>
+                      <pre>{file.preview ?? "No preview available."}</pre>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <p className="muted">No validation artifacts found for this task yet.</p>
+          )}
         </section>
 
         <section className="grid two-up">

@@ -156,6 +156,14 @@ type TaskDetailResponse = {
     path: string;
     kind: "prompt" | "result" | "meta" | "other";
   }>;
+  artifactFiles: Array<{
+    name: string;
+    relativePath: string;
+    path: string;
+    url: string;
+    kind: "image" | "text" | "other";
+    preview?: string;
+  }>;
 };
 
 const repoRoot = process.cwd();
@@ -535,6 +543,88 @@ function listTraceFiles(traceDir: string | undefined): TaskDetailResponse["trace
   }));
 }
 
+function getArtifactDirForTask(task: TaskState): string {
+  return path.join(getReportsDirForTask(task), `${task.id}.artifacts`);
+}
+
+function listFilesRecursive(dir: string, prefix = ""): string[] {
+  if (!fs.existsSync(dir)) return [];
+  const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  const files: string[] = [];
+  for (const entry of entries) {
+    const relativePath = prefix ? path.posix.join(prefix, entry.name) : entry.name;
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listFilesRecursive(fullPath, relativePath));
+      continue;
+    }
+    if (entry.isFile()) files.push(relativePath);
+  }
+  return files;
+}
+
+function isImageArtifact(fileName: string): boolean {
+  return [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].includes(path.extname(fileName).toLowerCase());
+}
+
+function isTextArtifact(fileName: string): boolean {
+  return [".txt", ".log", ".md", ".json", ".pid"].includes(path.extname(fileName).toLowerCase());
+}
+
+function readArtifactPreview(filePath: string): string | undefined {
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return undefined;
+  const maxBytes = 8 * 1024;
+  const maxLines = 60;
+  try {
+    return fs.readFileSync(filePath, "utf-8").slice(0, maxBytes).split("\n").slice(0, maxLines).join("\n").trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function listArtifactFiles(task: TaskState): TaskDetailResponse["artifactFiles"] {
+  const artifactDir = getArtifactDirForTask(task);
+  return listFilesRecursive(artifactDir).map((relativePath) => {
+    const artifactPath = path.join(artifactDir, relativePath);
+    const kind =
+      isImageArtifact(relativePath) ? "image"
+      : isTextArtifact(relativePath) ? "text"
+      : "other";
+    return {
+      name: path.posix.basename(relativePath),
+      relativePath,
+      path: artifactPath,
+      url: `/api/tasks/${encodeURIComponent(task.id)}/artifacts/${relativePath.split("/").map(encodeURIComponent).join("/")}`,
+      kind,
+      preview: kind === "text" ? readArtifactPreview(artifactPath) : undefined,
+    };
+  });
+}
+
+function getContentType(filePath: string): string {
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".svg":
+      return "image/svg+xml";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".txt":
+    case ".log":
+    case ".md":
+      return "text/plain; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
+}
+
 function getStopRequestPath(task: TaskState): string {
   return path.join(getReportsDirForTask(task), `${task.id}.stop`);
 }
@@ -569,6 +659,7 @@ function buildTaskDetail(taskId: string): TaskDetailResponse | undefined {
       reportPreview: readPreview(task.reportMarkdownPath ?? path.join(getReportsDirForTask(task), `${task.id}.md`), 24),
     },
     traceFiles: listTraceFiles(task.traceDir),
+    artifactFiles: listArtifactFiles(task),
   };
 }
 
@@ -591,6 +682,32 @@ function attachApi(server: ViteDevServer | PreviewServer): void {
     }
 
     const pathname = url.replace(/^\/+/, "").split("?")[0] ?? "";
+    const artifactPrefix = pathname.match(/^(.*)\/artifacts\/(.*)$/);
+    if (artifactPrefix && req.method === "GET") {
+      const taskId = decodeURIComponent(artifactPrefix[1] ?? "");
+      const relativePath = (artifactPrefix[2] ?? "").split("/").map(decodeURIComponent).join("/");
+      if (!taskId || !relativePath) {
+        sendJson(res, { error: "Artifact path required" }, 400);
+        return;
+      }
+      const task = loadTask(taskId);
+      if (!task) {
+        sendJson(res, { error: `Task not found: ${taskId}` }, 404);
+        return;
+      }
+      const artifactDir = getArtifactDirForTask(task);
+      const normalizedRelative = path.normalize(relativePath);
+      const artifactPath = path.resolve(artifactDir, normalizedRelative);
+      const artifactRoot = path.resolve(artifactDir) + path.sep;
+      if (!artifactPath.startsWith(artifactRoot) || !fs.existsSync(artifactPath) || !fs.statSync(artifactPath).isFile()) {
+        sendJson(res, { error: "Artifact not found" }, 404);
+        return;
+      }
+      res.setHeader("Content-Type", getContentType(artifactPath));
+      res.end(fs.readFileSync(artifactPath));
+      return;
+    }
+
     const action =
       pathname.endsWith("/stop") ? "stop"
       : pathname.endsWith("/commit") ? "commit"
